@@ -1,0 +1,193 @@
+﻿import os, uuid, hashlib
+from datetime import timedelta
+from django.conf import settings
+from django.db import connection, transaction
+from django.db.models.deletion import ProtectedError
+from django.http import JsonResponse
+from django.utils import timezone
+from rest_framework import viewsets, status
+from rest_framework.decorators import action, api_view
+from rest_framework.response import Response
+from django.contrib.auth import authenticate, login
+from django.contrib.auth.models import User, Group
+from .models import *
+from .serializers import *
+from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url
+from .roles import RolePermission
+
+class RoleProtectedMixin:
+    def get_permissions(self):
+        return [RolePermission()]
+
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
+
+def s3_client():
+    import boto3
+    return boto3.client('s3', endpoint_url=settings.MINIO_ENDPOINT, aws_access_key_id=os.getenv('MINIO_ROOT_USER','minio_admin'), aws_secret_access_key=os.getenv('MINIO_ROOT_PASSWORD','minio@2026'), region_name='us-east-1')
+
+def health_live(request): return JsonResponse({'status':'ok'})
+def health_ready(request):
+    try:
+        with connection.cursor() as cursor: cursor.execute('SELECT 1')
+        return JsonResponse({'status':'ok'})
+    except Exception as exc: return JsonResponse({'status':'error','detail':str(exc)}, status=503)
+
+class CategoryViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('admin',)
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    queryset = Category.objects.all(); serializer_class = CategorySerializer
+    @action(detail=False, methods=['post'], url_path='import')
+    def import_rows(self, request):
+        rows = request.data.get('rows') or []
+        created = 0
+        for row in rows:
+            code = str(row.get('code') or row.get('major_code','') + row.get('minor_code',''))
+            if len(code) == 2: major, minor = code, '00'
+            else: major, minor = code[:2], code[2:4]
+            Category.objects.update_or_create(major_code=major, minor_code=minor, defaults={'name':row.get('name',''),'major_name':row.get('parent_name','') or row.get('name',''),'parent_code':row.get('parent_code',''),'parent_name':row.get('parent_name',''),'path':row.get('full_path',''),'description':row.get('description',''),'aliases':row.get('aliases',''),'standard_references':row.get('standard_references',''),'is_selectable':str(row.get('is_selectable','true')).lower() not in ('false','0'),'attribute_group':row.get('attribute_groups',''),'part_nature':row.get('part_nature',''),'catalog_version':row.get('catalog_version',''),'is_leaf':len(code)>2}); created += 1
+        return Response({'created':created,'total':len(rows)})
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.query_params.get('major_code'): qs = qs.filter(major_code=self.request.query_params['major_code'])
+        return qs
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response({'detail':'category is used by parts and cannot be deleted; disable it instead'}, status=status.HTTP_409_CONFLICT)
+
+class UnitViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('admin',)
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response({'detail':'unit is in use and cannot be deleted'}, status=status.HTTP_409_CONFLICT)
+    queryset = Unit.objects.all(); serializer_class = UnitSerializer
+class PartViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('engineer','admin')
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    queryset = Part.objects.select_related('category').prefetch_related('revisions'); serializer_class = PartSerializer
+    def perform_update(self, serializer):
+        expected = self.request.headers.get('If-Match')
+        if expected and str(serializer.instance.row_version) != expected: from rest_framework.exceptions import APIException; raise APIException('row_version conflict')
+        serializer.save(row_version=serializer.instance.row_version+1)
+    def destroy(self, request, *args, **kwargs):
+        """Admin delete keeps released history safe by retiring the Part.
+
+        A Part always has at least one protected PartRevision, so a raw
+        ``DELETE`` would raise a database 500.  Expose the admin delete
+        action as an idempotent retirement (obsolete) while allowing truly
+        empty draft records to be removed physically.
+        """
+        instance = self.get_object()
+        if instance.revisions.exists():
+            instance.status = 'obsolete'
+            instance.row_version += 1
+            instance.save(update_fields=['status','row_version','updated_at'])
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response({'detail':'part is referenced and cannot be deleted'}, status=status.HTTP_409_CONFLICT)
+class BOMViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('engineer','admin')
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    queryset = BOM.objects.prefetch_related('revisions__items'); serializer_class = BOMSerializer
+
+class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
+    write_roles = ('engineer','admin')
+    def create(self, request):
+        data = request.data; size = int(data.get('size') or 0)
+        if size <= 0 or size > MAX_UPLOAD_BYTES: return Response({'detail':'size must be between 1 byte and 5GiB','max_bytes':MAX_UPLOAD_BYTES}, status=400)
+        filename = os.path.basename(str(data.get('filename') or 'upload.bin'))[:255]
+        chunks = max(1, int(data.get('total_chunks') or ((size + 64*1024*1024-1)//(64*1024*1024))))
+        if chunks > 10000: return Response({'detail':'鍒嗙墖鏁伴噺瓒呴檺'}, status=400)
+        bucket = settings.MINIO_BUCKET_QUARANTINE; key = f"uploads/{timezone.now():%Y/%m/%d}/{uuid.uuid4()}-{filename}"
+        try:
+            client = s3_client(); mpu = client.create_multipart_upload(Bucket=bucket, Key=key, ContentType=data.get('content_type') or 'application/octet-stream')
+            upload_id = mpu['UploadId']; urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=3600) for i in range(1,chunks+1)]
+        except Exception as exc: return Response({'detail':f'MinIO unavailable: {exc}'}, status=503)
+        obj = UploadSession.objects.create(object_key=key,bucket=bucket,filename=filename,content_type=data.get('content_type') or '',size=size,total_chunks=chunks,declared_sha256=data.get('sha256') or '',upload_id=upload_id,expires_at=timezone.now()+timedelta(hours=2))
+        return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,'part_urls':urls,'expires_at':obj.expires_at}, status=201)
+    def retrieve(self, request, pk=None):
+        try: obj=UploadSession.objects.get(pk=pk)
+        except UploadSession.DoesNotExist: return Response({'detail':'not found'},status=404)
+        return Response(UploadSessionSerializer(obj).data)
+    @action(detail=True, methods=['post'], url_path='complete')
+    def complete(self, request, pk=None):
+        try: obj=UploadSession.objects.get(pk=pk)
+        except UploadSession.DoesNotExist: return Response({'detail':'not found'},status=404)
+        parts = request.data.get('parts') or []
+        if not parts or len(parts) != obj.total_chunks: return Response({'detail':'invalid multipart parts'},status=400)
+        try:
+            s3_client().complete_multipart_upload(Bucket=obj.bucket,Key=obj.object_key,UploadId=obj.upload_id,MultipartUpload={'Parts':[{'ETag':p['etag'],'PartNumber':int(p['part_number'])} for p in parts]})
+            obj.state='uploaded'; obj.save(update_fields=['state'])
+        except Exception as exc: return Response({'detail':str(exc)},status=400)
+        return Response(UploadSessionSerializer(obj).data)
+
+class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('engineer','admin')
+    queryset=ImportJob.objects.all().order_by('-created_at'); serializer_class=ImportJobSerializer
+    def create(self, request):
+        payload=request.data.copy(); payload['upload_session']=payload.get('upload_session') or payload.get('upload_session_id'); payload['kind']=payload.get('kind') or 'part'
+        ser=self.get_serializer(data=payload); ser.is_valid(raise_exception=True); job=ser.save()
+        try: run_import_job.delay(str(job.id), commit=False)
+        except Exception: pass
+        return Response(self.get_serializer(job).data, status=201)
+    @action(detail=True, methods=['post'])
+    def actions(self, request, pk=None):
+        job=self.get_object(); name=request.data.get('action')
+        if name=='commit':
+            try: run_import_job.delay(str(job.id), commit=True)
+            except Exception: run_import_job(str(job.id), commit=True)
+        elif name=='cancel': cancel_import_job(job.id)
+        else: return Response({'detail':'action must be commit or cancel'}, status=400)
+        job.refresh_from_db(); return Response(self.get_serializer(job).data)
+
+class ExportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('viewer','engineer','reviewer','publisher','admin')
+    queryset=ExportJob.objects.all().order_by('-created_at'); serializer_class=ExportJobSerializer
+    def create(self, request):
+        ser=self.get_serializer(data=request.data); ser.is_valid(raise_exception=True); job=ser.save()
+        try: run_export_job.delay(str(job.id))
+        except Exception: pass
+        return Response(self.get_serializer(job).data, status=201)
+    @action(detail=True, methods=['get'])
+    def download(self, request, pk=None):
+        job=self.get_object(); url=export_download_url(job)
+        if not url: return Response({'detail':'export not ready'}, status=409)
+        return Response({'url':url, 'expires_in':3600})
+    @action(detail=True, methods=['post'])
+    def actions(self, request, pk=None):
+        if request.data.get('action')=='cancel': cancel_export_job(self.get_object().id); return Response(self.get_serializer(self.get_object()).data)
+        return Response({'detail':'action must be cancel'}, status=400)
+
+@api_view(['GET'])
+def storage_health(request):
+    try:
+        c=s3_client(); buckets=[settings.MINIO_BUCKET_QUARANTINE,settings.MINIO_BUCKET_DRAFT,settings.MINIO_BUCKET_RELEASE,settings.MINIO_BUCKET_EXPORT]; [c.head_bucket(Bucket=b) for b in buckets]; return Response({'status':'ok','endpoint':settings.MINIO_ENDPOINT,'buckets':buckets})
+    except Exception as exc: return Response({'status':'error','detail':str(exc)},status=503)
+
+
+@api_view(['POST'])
+def ldap_login(request):
+    username = request.data.get('username','').strip(); password = request.data.get('password','')
+    if not username or not password: return Response({'detail':'username and password required'}, status=400)
+    # LDAP integration point: when LDAP is disabled, Django local auth remains available for local testing.
+    user = authenticate(request, username=username, password=password)
+    if not user: return Response({'detail':'invalid credentials'}, status=401)
+    login(request, user)
+    role = 'viewer'
+    if user.is_superuser: role = 'admin'
+    elif user.groups.filter(name='engineer').exists(): role = 'engineer'
+    elif user.groups.filter(name='reviewer').exists(): role = 'reviewer'
+    return Response({'user':username,'role':role})
+
+
+

@@ -1,0 +1,31 @@
+.git
+.git/**
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+.env
+*.log
+staticfiles/
+media/
+backups/
+
+# Protected/encrypted implementation is for the local interpreter only.  It
+# must never be sent to Docker's build context or mounted into a container.
+**/*.encrypted.py
+**/*.enc.py
+**/*_protected.py
+**/encrypted/**
+**/.protected/**
+**/protected/**
+
+# Local protected wrappers are excluded from the container build context.
+# Runtime Python files are container-safe and must be included. The Dockerfile
+# still materializes protected runtime templates for the explicitly templated
+# modules (settings, models, entrypoint, etc.).
+
+

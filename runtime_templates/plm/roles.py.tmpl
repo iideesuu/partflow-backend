@@ -1,0 +1,52 @@
+﻿from functools import wraps
+from django.contrib.auth.models import Group
+from django.contrib.auth import get_user_model
+from rest_framework.permissions import BasePermission
+
+ROLES=('viewer','engineer','reviewer','publisher','admin')
+ROLE_ALIASES={'release_manager':'publisher'}
+ROLE_PERMISSIONS={'viewer':{'parts.read','bom.read','attachments.read'},'engineer':{'parts.read','parts.create','parts.edit','bom.read','bom.edit','attachments.upload','imports.create'},'reviewer':{'parts.read','bom.read','attachments.read','review.submit','review.decide'},'publisher':{'parts.read','bom.read','review.read','release.publish','attachments.read'},'admin':set()}
+
+def user_role(user):
+    if getattr(user,'is_superuser',False): return 'admin'
+    if not getattr(user,'is_authenticated',False): return None
+    raw=next((g.name[4:] for g in user.groups.all() if g.name.startswith('plm:')),None)
+    return ROLE_ALIASES.get(raw,raw)
+
+def has_permission(user,permission): return permission in ROLE_PERMISSIONS.get(user_role(user),set())
+
+class RolePermission(BasePermission):
+    def has_permission(self,request,view):
+        role=user_role(request.user)
+        if not role: return False
+        # Read operations are available to every authenticated PLM role unless
+        # a view explicitly narrows ``read_roles``.  Previously the
+        # ``write_roles`` tuple was applied to GET as well, which prevented
+        # viewers and reviewers from opening the category/part lists.
+        if request.method in ('GET','HEAD','OPTIONS'):
+            allowed = getattr(view, 'read_roles', None)
+            return not allowed or role == 'admin' or role in allowed
+        # Destructive operations can be stricter than create/update.  This is
+        # used by the admin catalog screens to keep accidental deletes out of
+        # engineer workflows.
+        if request.method == 'DELETE' and hasattr(view, 'delete_roles'):
+            allowed = view.delete_roles
+        else:
+            allowed = getattr(view, 'roles', None) or getattr(view, 'write_roles', None)
+        return not allowed or role == 'admin' or role in allowed
+
+def require_role(*roles):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(request,*args,**kwargs):
+            if user_role(request.user) not in roles: from django.http import JsonResponse; return JsonResponse({'detail':'permission denied'},status=403)
+            return view(request,*args,**kwargs)
+        return wrapped
+    return decorator
+
+def assign_role(actor,username,role):
+    if user_role(actor)!='admin': raise PermissionError('admin role required')
+    role=ROLE_ALIASES.get(role,role)
+    if role not in ROLES: raise ValueError('invalid role')
+    target=get_user_model().objects.get(username=username); target.groups.set([Group.objects.get_or_create(name=f'plm:{role}')[0]]); return target
+

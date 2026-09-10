@@ -1,0 +1,143 @@
+import uuid
+from django.db import models
+
+class Category(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    major_code = models.CharField(max_length=2)
+    minor_code = models.CharField(max_length=2)
+    name = models.CharField(max_length=120)
+    major_name = models.CharField(max_length=120, blank=True)
+    path = models.CharField(max_length=255, blank=True)
+    attribute_group = models.CharField(max_length=255, blank=True)
+    parent_code = models.CharField(max_length=2, blank=True)
+    parent_name = models.CharField(max_length=120, blank=True)
+    description = models.TextField(blank=True)
+    aliases = models.CharField(max_length=500, blank=True)
+    standard_references = models.CharField(max_length=500, blank=True)
+    is_selectable = models.BooleanField(default=True)
+    part_nature = models.CharField(max_length=32, blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    catalog_version = models.CharField(max_length=32, blank=True)
+    is_enabled = models.BooleanField(default=True)
+    is_leaf = models.BooleanField(default=True)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['major_code','minor_code'], name='uniq_category_code')]
+        ordering = ['major_code','minor_code']
+    @property
+    def code(self): return f'{self.major_code}{self.minor_code}'
+
+class Unit(models.Model):
+    code = models.CharField(max_length=32, unique=True)
+    name = models.CharField(max_length=64)
+    dimension = models.CharField(max_length=32, default='each')
+    def __str__(self): return self.name
+
+class NumberSource(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=120)
+    url = models.URLField(unique=True)
+    is_enabled = models.BooleanField(default=True)
+
+class NumberRequest(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    source = models.ForeignKey(NumberSource, on_delete=models.PROTECT)
+    source_request_id = models.CharField(max_length=150)
+    operation_key = models.CharField(max_length=150, unique=True)
+    returned_part_code = models.CharField(max_length=32, blank=True)
+    status = models.CharField(max_length=20, default='draft')
+
+class Part(models.Model):
+    STATUS_CHOICES = [('draft','Draft'),('pending_review','Pending review'),('approved','Approved'),('released','Released'),('obsolete','Obsolete')]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant_id = models.CharField(max_length=64, default='default')
+    part_code = models.CharField(max_length=32, unique=True)
+    category = models.ForeignKey(Category, on_delete=models.PROTECT, null=True, blank=True, related_name='parts')
+    number_request = models.ForeignKey(NumberRequest, on_delete=models.PROTECT, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    row_version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    class Meta: ordering = ['part_code']
+    @property
+    def part_number(self): return self.part_code
+
+class PartRevision(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    part = models.ForeignKey(Part, related_name='revisions', on_delete=models.PROTECT)
+    revision = models.CharField(max_length=8, default='A')
+    revision_seq = models.PositiveIntegerField(default=1)
+    name = models.CharField(max_length=200)
+    kind = models.CharField(max_length=32, default='standard')
+    business_lifecycle = models.CharField(max_length=20, default='active')
+    unit = models.ForeignKey(Unit, on_delete=models.PROTECT, null=True, blank=True)
+    standard_code = models.CharField(max_length=64, blank=True)
+    material = models.CharField(max_length=128, blank=True)
+    manufacturer = models.CharField(max_length=128, blank=True)
+    manufacturer_part_number = models.CharField(max_length=128, blank=True)
+    is_customized = models.BooleanField(default=False)
+    rohs_standard = models.CharField(max_length=128, blank=True)
+    description = models.TextField(blank=True)
+    revision_state = models.CharField(max_length=20, default='draft')
+    row_version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['part','revision'], name='unique_part_revision')]
+        ordering = ['part','revision_seq']
+
+class BOM(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bom_code = models.CharField(max_length=64, unique=True)
+    bom_type = models.CharField(max_length=8, default='EBOM')
+    name = models.CharField(max_length=200, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class BOMRevision(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bom = models.ForeignKey(BOM, related_name='revisions', on_delete=models.PROTECT)
+    revision = models.CharField(max_length=8, default='A')
+    root_part_revision = models.ForeignKey(PartRevision, on_delete=models.PROTECT)
+    revision_state = models.CharField(max_length=20, default='draft')
+
+class BOMItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    bom_revision = models.ForeignKey(BOMRevision, related_name='items', on_delete=models.PROTECT)
+    line_no = models.PositiveIntegerField()
+    child_part_revision = models.ForeignKey(PartRevision, on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=18, decimal_places=6)
+    unit = models.ForeignKey(Unit, on_delete=models.PROTECT, null=True, blank=True)
+    position = models.CharField(max_length=128, default='__NO_POSITION__')
+    class Meta: constraints = [models.UniqueConstraint(fields=['bom_revision','line_no'], name='uniq_bom_line')]
+
+class UploadSession(models.Model):
+    STATES = [('created','Created'),('uploaded','Uploaded'),('verified','Verified'),('failed','Failed'),('expired','Expired')]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    object_key = models.CharField(max_length=512, unique=True)
+    bucket = models.CharField(max_length=128)
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=255, blank=True)
+    size = models.BigIntegerField()
+    total_chunks = models.PositiveIntegerField(default=1)
+    declared_sha256 = models.CharField(max_length=64, blank=True)
+    state = models.CharField(max_length=20, choices=STATES, default='created')
+    upload_id = models.CharField(max_length=255, blank=True)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class ImportJob(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kind = models.CharField(max_length=32, choices=[('category','category'),('part','part'),('bom','bom')])
+    upload_session = models.ForeignKey(UploadSession, on_delete=models.PROTECT)
+    status = models.CharField(max_length=20, default='queued')
+    summary = models.JSONField(default=dict, blank=True)
+    error_report_key = models.CharField(max_length=512, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class ExportJob(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kind = models.CharField(max_length=32)
+    format = models.CharField(max_length=16, default='csv')
+    status = models.CharField(max_length=20, default='queued')
+    object_key = models.CharField(max_length=512, blank=True)
+    filters = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
