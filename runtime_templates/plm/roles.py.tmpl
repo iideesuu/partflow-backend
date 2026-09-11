@@ -2,6 +2,7 @@
 from django.contrib.auth.models import Group
 from django.contrib.auth import get_user_model
 from rest_framework.permissions import BasePermission
+from .models import UserSecurity
 
 ROLES=('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
 ROLE_ALIASES={'release_manager':'publisher'}
@@ -25,10 +26,10 @@ class RolePermission(BasePermission):
         # viewers and reviewers from opening the category/part lists.
         if request.method in ('GET','HEAD','OPTIONS'):
             allowed = getattr(view, 'read_roles', None)
-            return not allowed or role in ('admin','sysadmin') or role in allowed
+            return not allowed or role == 'admin' or role in allowed
         action_roles = getattr(view, 'action_roles', {}).get(getattr(view, 'action', ''), None)
         if action_roles is not None:
-            return role in ('admin','sysadmin') or role in action_roles
+            return role == 'admin' or role in action_roles
         # Destructive operations can be stricter than create/update.  This is
         # used by the admin catalog screens to keep accidental deletes out of
         # engineer workflows.
@@ -36,7 +37,7 @@ class RolePermission(BasePermission):
             allowed = view.delete_roles
         else:
             allowed = getattr(view, 'roles', None) or getattr(view, 'write_roles', None)
-        return not allowed or role in ('admin','sysadmin') or role in allowed
+        return not allowed or role == 'admin' or role in allowed
 
 def require_role(*roles):
     def decorator(view):
@@ -48,8 +49,15 @@ def require_role(*roles):
     return decorator
 
 def assign_role(actor,username,role):
-    if user_role(actor)!='admin': raise PermissionError('admin role required')
+    if user_role(actor) not in ('admin','sysadmin'): raise PermissionError('admin or sysadmin role required')
     role=ROLE_ALIASES.get(role,role)
     if role not in ROLES: raise ValueError('invalid role')
-    target=get_user_model().objects.get(username=username); target.groups.set([Group.objects.get_or_create(name=f'plm:{role}')[0]]); return target
-
+    target=get_user_model().objects.get(username=username)
+    business_groups = list(target.groups.filter(name__startswith='plm:'))
+    target.groups.remove(*business_groups)
+    target.groups.add(Group.objects.get_or_create(name=f'plm:{role}')[0])
+    security, _ = UserSecurity.objects.get_or_create(user=target)
+    security.permission_version += 1
+    security.session_nonce = __import__('uuid').uuid4()
+    security.save(update_fields=['permission_version', 'session_nonce', 'updated_at'])
+    return target

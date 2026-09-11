@@ -1,0 +1,115 @@
+"""Transactional validation for EBOM tree rows.
+
+The checks live outside the view so imports, API writes and lifecycle gates can
+reuse exactly the same rules.  Database FKs prevent dangling rows; these
+checks protect the graph and the frozen V1.6 size/immutability contract.
+"""
+from decimal import Decimal
+from rest_framework.exceptions import APIException
+
+MAX_ROWS = 2000
+MAX_DEPTH = 15
+MAX_NODES = 20000
+
+
+class BOMValidationError(APIException):
+    status_code = 422
+
+
+def _error(code, detail, field=None):
+    error = BOMValidationError({'code': code, 'detail': detail, **({'field': field} if field else {})})
+    if code in ('IMMUTABLE_REVISION', 'DUPLICATE_POSITION'):
+        error.status_code = 409
+    raise error
+
+
+def validate_bom_item(*, bom_revision, child_part_revision, quantity, unit=None,
+                      parent_item=None, position='__NO_POSITION__', instance=None):
+    if bom_revision is None:
+        _error('BOM_REVISION_REQUIRED', 'bom_revision is required', 'bom_revision')
+    if bom_revision.revision_state != 'draft':
+        _error('IMMUTABLE_REVISION', 'BOM revision is immutable outside draft state', 'bom_revision')
+    if child_part_revision is None:
+        _error('CHILD_REVISION_REQUIRED', 'child_part_revision is required', 'child_part_revision')
+    if child_part_revision.revision_state != 'released':
+        code = 'REFERENCED_REVISION_OBSOLETE' if child_part_revision.revision_state == 'obsolete' else 'REFERENCED_REVISION_NOT_RELEASED'
+        _error(code, 'child revision must be released', 'child_part_revision')
+    if parent_item is not None and parent_item.bom_revision_id != bom_revision.pk:
+        _error('PARENT_ITEM_CROSS_BOM', 'parent item belongs to another BOM revision', 'parent_item')
+    try:
+        qty = Decimal(str(quantity))
+    except Exception:
+        _error('QUANTITY_PRECISION_INVALID', 'quantity must be a decimal', 'quantity')
+    if not qty.is_finite():
+        _error('QUANTITY_PRECISION_INVALID', 'quantity must be finite', 'quantity')
+    if qty <= 0:
+        _error('QUANTITY_INVALID', 'quantity must be greater than zero', 'quantity')
+    if qty.as_tuple().exponent < -6 or qty.adjusted() > 11:
+        _error('QUANTITY_PRECISION_INVALID', 'quantity supports at most 6 decimal places', 'quantity')
+    if unit is not None:
+        if hasattr(unit, 'is_active') and not unit.is_active:
+            _error('UNIT_INACTIVE', 'unit is inactive', 'unit')
+        child_unit = getattr(child_part_revision, 'unit', None)
+        if child_unit is not None and unit.dimension != child_unit.dimension:
+            _error('UNIT_DIMENSION_MISMATCH', 'unit dimension does not match child revision', 'unit')
+    if position != '__NO_POSITION__':
+        import re
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,31}', str(position)):
+            _error('POSITION_FORMAT_INVALID', 'invalid reference designator', 'position')
+        qs = bom_revision.items.filter(position=position)
+        if parent_item is None:
+            qs = qs.filter(parent_item__isnull=True)
+        else:
+            qs = qs.filter(parent_item=parent_item)
+        if instance is not None:
+            qs = qs.exclude(pk=instance.pk)
+        if qs.exists():
+            _error('DUPLICATE_POSITION', 'position must be unique under the same parent', 'position')
+    if instance is not None and instance.bom_revision_id != bom_revision.pk:
+        _error('PARENT_ITEM_CROSS_BOM', 'item belongs to another BOM revision')
+    if instance is not None and parent_item is not None and parent_item.pk == instance.pk:
+        _error('BOM_CYCLE_DETECTED', 'an item cannot parent itself', 'parent_item')
+    if parent_item is not None:
+        seen = {str(instance.pk)} if instance is not None else set()
+        cursor = parent_item
+        depth = 1
+        while cursor is not None:
+            key = str(cursor.pk)
+            if key in seen:
+                _error('BOM_CYCLE_DETECTED', 'parent chain contains a cycle', 'parent_item')
+            seen.add(key)
+            depth += 1
+            cursor = cursor.parent_item
+        if depth > MAX_DEPTH:
+            _error('BOM_TREE_BUDGET_EXCEEDED', f'BOM tree depth exceeds {MAX_DEPTH}', 'parent_item')
+    rows_qs = bom_revision.items.all()
+    if instance is not None:
+        rows_qs = rows_qs.exclude(pk=instance.pk)
+    count = rows_qs.count()
+    if count >= MAX_ROWS:
+        _error('BOM_SIZE_LIMIT_EXCEEDED', f'BOM revision supports at most {MAX_ROWS} rows', 'bom_revision')
+    return True
+
+
+def validate_bom_tree(bom_revision):
+    """Run full graph checks before submit/publish; returns node count."""
+    rows = list(bom_revision.items.select_related('parent_item', 'child_part_revision__unit', 'unit'))
+    if len(rows) > MAX_ROWS:
+        _error('BOM_SIZE_LIMIT_EXCEEDED', f'BOM revision supports at most {MAX_ROWS} rows')
+    by_id = {str(row.pk): row for row in rows}
+    total = 0
+    for row in rows:
+        if row.parent_item_id and str(row.parent_item_id) not in by_id:
+            _error('PARENT_ITEM_CROSS_BOM', 'parent item belongs to another BOM revision')
+        depth, seen, cursor = 1, set(), row
+        while cursor.parent_item_id:
+            key = str(cursor.parent_item_id)
+            if key in seen or key not in by_id:
+                _error('BOM_CYCLE_DETECTED', 'BOM contains a cycle')
+            seen.add(key); cursor = by_id[key]; depth += 1
+        if depth > MAX_DEPTH:
+            _error('BOM_TREE_BUDGET_EXCEEDED', f'BOM tree depth exceeds {MAX_DEPTH}')
+        total += 1
+    if total > MAX_NODES:
+        _error('BOM_TREE_BUDGET_EXCEEDED', f'expanded tree exceeds {MAX_NODES} nodes')
+    return total

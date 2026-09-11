@@ -1,14 +1,36 @@
-﻿import json, os
+﻿import json, os, hashlib
+from django.core.cache import cache
 from django.contrib.auth import authenticate as django_authenticate, login, logout, get_user_model
+from django.contrib.auth.models import User
+from datetime import timedelta
 from django.http import JsonResponse
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 from .auth import authenticate as ldap_authenticate, shadow_user, ldap_enabled
 from .roles import user_role, assign_role, ROLES
+from .models import UserSecurity
+from django.utils import timezone
 
-def _payload(user):
+def _rate_key(username, request):
+    remote = request.META.get('REMOTE_ADDR', 'unknown')
+    raw = ((username or '').strip().lower() + '|' + remote).encode()
+    return 'plm:auth:fail:' + hashlib.sha256(raw).hexdigest()
+
+def _rate_status(username, request):
+    key = _rate_key(username, request)
+    return key, int(cache.get(key, 0) or 0)
+
+def _auth_failure(username, request):
+    key, count = _rate_status(username, request)
+    count += 1
+    cache.set(key, count, 15 * 60)
+    return count
+
+def _payload(user, request=None):
     role=user_role(user)
-    return {'username':user.username,'display_name':user.first_name,'role':role}
+    security, _ = UserSecurity.objects.get_or_create(user=user)
+    permission_version = security.permission_version
+    return {'username':user.username,'display_name':user.first_name,'role':role,'permission_version':permission_version}
 
 @ensure_csrf_cookie
 @require_http_methods(['GET'])
@@ -20,30 +42,73 @@ def login_view(request):
     if request.method == 'GET':
         return JsonResponse({'detail':'login endpoint','method':'POST','fields':['username','password'],'csrf':'GET /api/v1/auth/csrf/ first'})
     try: data=json.loads(request.body or '{}')
-    except ValueError: return JsonResponse({'detail':'invalid JSON'},status=400)
+    except ValueError: return JsonResponse({'code':'INVALID_JSON','detail':'invalid JSON'},status=400)
+    username = str(data.get('username') or '').strip()
+    key, failures = _rate_status(username, request)
+    if failures >= 5:
+        return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
+    local_user = get_user_model().objects.filter(username=username).first()
+    local_security = UserSecurity.objects.filter(user=local_user).first() if local_user else None
+    if local_security and local_security.locked_until and local_security.locked_until > timezone.now():
+        retry = max(1, int((local_security.locked_until - timezone.now()).total_seconds()))
+        return JsonResponse({'code':'RATE_LIMITED','detail':'account temporarily locked','retry_after':retry}, status=429, headers={'Retry-After':str(retry)})
     if ldap_enabled():
         try: user=shadow_user(ldap_authenticate(data.get('username',''),data.get('password','')))
-        except Exception: return JsonResponse({'detail':'LDAP authentication failed'},status=401)
+        except Exception:
+            failures = _auth_failure(username, request)
+            if local_security:
+                local_security.failed_attempts += 1
+                if local_security.failed_attempts >= 5: local_security.locked_until = timezone.now() + timedelta(minutes=15)
+                local_security.save(update_fields=['failed_attempts','locked_until','updated_at'])
+            if failures >= 5: return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
+            return JsonResponse({'code':'AUTH_INVALID','detail':'LDAP authentication failed'},status=401)
     else:
-        user=django_authenticate(request,username=data.get('username',''),password=data.get('password',''))
-        if not user: return JsonResponse({'detail':'invalid credentials'},status=401)
+        user=django_authenticate(request,username=username,password=data.get('password',''))
+        if not user:
+            failures = _auth_failure(username, request)
+            if local_security:
+                local_security.failed_attempts += 1
+                if local_security.failed_attempts >= 5: local_security.locked_until = timezone.now() + timedelta(minutes=15)
+                local_security.save(update_fields=['failed_attempts','locked_until','updated_at'])
+            if failures >= 5: return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
+            return JsonResponse({'code':'AUTH_INVALID','detail':'invalid credentials'},status=401)
+    cache.delete(key)
+    security, _ = UserSecurity.objects.get_or_create(user=user)
+    security.failed_attempts = 0
+    security.locked_until = None
+    security.save(update_fields=['failed_attempts','locked_until','updated_at'])
     login(request,user,backend='django.contrib.auth.backends.ModelBackend')
-    result=_payload(user); return JsonResponse({'role':result['role'],'user':result})
+    now = timezone.now().timestamp()
+    request.session['authenticated_at'] = now
+    request.session['last_seen_at'] = now
+    request.session['permission_version'] = security.permission_version
+    request.session['session_nonce'] = str(security.session_nonce)
+    result=_payload(user, request); return JsonResponse({'role':result['role'],'user':result})
 
 @ensure_csrf_cookie
 @require_http_methods(['GET'])
 def me(request):
     if not request.user.is_authenticated: return JsonResponse({'authenticated':False},status=401)
-    result=_payload(request.user); return JsonResponse({'authenticated':True,'role':result['role'],'user':result})
+    result=_payload(request.user, request); return JsonResponse({'authenticated':True,'role':result['role'],'user':result})
 
 @require_http_methods(['POST'])
 def logout_view(request): logout(request); return JsonResponse({'detail':'logged out'})
 
 @require_http_methods(['GET','POST'])
 def users(request):
-    if not request.user.is_authenticated or user_role(request.user)!='admin': return JsonResponse({'detail':'permission denied'},status=403)
+    if not request.user.is_authenticated or user_role(request.user) not in ('admin','sysadmin'): return JsonResponse({'code':'ROLE_REQUIRED','detail':'sysadmin role required'},status=403)
     User=get_user_model()
     if request.method=='GET': return JsonResponse({'roles':ROLES,'users':[{'username':u.username,'active':u.is_active,'role':user_role(u)} for u in User.objects.order_by('username')]})
-    try: data=json.loads(request.body or '{}'); target=assign_role(request.user,data['username'],data['role'])
-    except (KeyError,ValueError,PermissionError,User.DoesNotExist) as exc: return JsonResponse({'detail':str(exc)},status=400)
-    return JsonResponse({'user':_payload(target)})
+    try:
+        data=json.loads(request.body or '{}')
+        target=assign_role(request.user,data['username'],data['role'])
+        security, _ = UserSecurity.objects.get_or_create(user=target)
+        action = str(data.get('action') or 'assign_role')
+        if action == 'disable': target.is_active = False; target.save(update_fields=['is_active'])
+        elif action == 'enable': target.is_active = True; target.save(update_fields=['is_active'])
+        elif action == 'revoke': security.revoked_at = timezone.now()
+        security.permission_version += 1
+        security.session_nonce = __import__('uuid').uuid4()
+        security.save(update_fields=['permission_version','session_nonce','revoked_at','updated_at'])
+    except (KeyError,ValueError,PermissionError,User.DoesNotExist) as exc: return JsonResponse({'code':'ROLE_ASSIGNMENT_INVALID','detail':str(exc)},status=400)
+    return JsonResponse({'user':_payload(target, request)})

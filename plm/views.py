@@ -17,6 +17,7 @@ from .models import *
 from .serializers import *
 from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url
 from .roles import RolePermission, user_role
+from .bom_services import validate_bom_tree
 
 def record_audit(request, action, obj=None, **details):
     return AuditEvent.objects.create(actor=request.user.username, action=action,
@@ -43,6 +44,36 @@ class RoleProtectedMixin:
         return [RolePermission()]
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
+
+def _complete_upload_session(obj, parts):
+    """Reconcile, complete, and verify one multipart session."""
+    normalized = sorted((int(p['part_number']), str(p['etag'])) for p in parts)
+    expected = list(range(1, obj.total_chunks + 1))
+    if [n for n, _ in normalized] != expected:
+        raise ValueError('UPLOAD_PART_MISSING')
+    control = s3_control()
+    remote, marker = [], None
+    while True:
+        params = {'Bucket': obj.bucket, 'Key': obj.object_key, 'UploadId': obj.upload_id}
+        if marker: params['PartNumberMarker'] = marker
+        page = control.list_parts(**params)
+        remote.extend((int(p['PartNumber']), str(p['ETag']).strip('"')) for p in page.get('Parts', []))
+        if not page.get('IsTruncated'): break
+        marker = str(page.get('NextPartNumberMarker') or '')
+        if not marker: raise ValueError('STORAGE_RECONCILIATION_FAILED')
+    submitted = [(num, etag.strip('"')) for num, etag in normalized]
+    if remote != submitted: raise ValueError('STORAGE_RECONCILIATION_FAILED')
+    control.complete_multipart_upload(Bucket=obj.bucket, Key=obj.object_key, UploadId=obj.upload_id, MultipartUpload={'Parts':[{'ETag':etag,'PartNumber':num} for num, etag in submitted]})
+    head = control.head_object(Bucket=obj.bucket, Key=obj.object_key)
+    if int(head.get('ContentLength', -1)) != int(obj.size): raise ValueError('UPLOAD_SIZE_MISMATCH')
+    if obj.declared_sha256:
+        digest = hashlib.sha256(); body = control.get_object(Bucket=obj.bucket, Key=obj.object_key)['Body']
+        try:
+            for chunk in iter(lambda: body.read(8 * 1024 * 1024), b''): digest.update(chunk)
+        finally: body.close()
+        if digest.hexdigest().lower() != obj.declared_sha256.strip().lower(): raise ValueError('UPLOAD_CHECKSUM_MISMATCH')
+    obj.state='uploaded'; obj.save(update_fields=['state'])
+    return obj
 
 def _s3(endpoint):
     import boto3
@@ -368,20 +399,20 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
             return Response({'code':'UPLOAD_SESSION_EXPIRED','detail':'upload session expired'}, status=409)
         parts = request.data.get('parts') or []
         if not parts or len(parts) != obj.total_chunks: return Response({'detail':'invalid multipart parts'},status=400)
+        if obj.size > int(getattr(settings, 'FINALIZE_SYNC_THRESHOLD', 5)) * 80 * 1024 * 1024:
+            job = FinalizeJob.objects.create(upload_session=obj, parts=parts)
+            try:
+                from .jobs import finalize_upload_job
+                finalize_upload_job.delay(str(job.id))
+            except Exception:
+                job.status='failed'; job.error='finalize worker unavailable'; job.save(update_fields=['status','error'])
+                return Response({'code':'SERVICE_PREREQUISITE_UNAVAILABLE','detail':'finalize worker unavailable'}, status=503)
+            return Response({'job_id':str(job.id),'status':'queued'}, status=202)
         try:
-            normalized = sorted((int(p['part_number']), str(p['etag'])) for p in parts)
-            expected = list(range(1, obj.total_chunks + 1))
-            if [n for n, _ in normalized] != expected:
-                return Response({'code':'UPLOAD_PART_MISSING','missing_parts':[n for n in expected if n not in {x for x,_ in normalized}]}, status=409)
-        except (KeyError, TypeError, ValueError):
-            return Response({'detail':'parts must contain part_number and etag'}, status=400)
-        try:
-            s3_client().complete_multipart_upload(Bucket=obj.bucket,Key=obj.object_key,UploadId=obj.upload_id,MultipartUpload={'Parts':[{'ETag':etag,'PartNumber':num} for num, etag in normalized]})
-            head = s3_client().head_object(Bucket=obj.bucket, Key=obj.object_key)
-            if int(head.get('ContentLength', -1)) != int(obj.size):
-                obj.state='failed'; obj.save(update_fields=['state'])
-                return Response({'code':'UPLOAD_SIZE_MISMATCH','expected':obj.size,'actual':head.get('ContentLength')}, status=422)
-            obj.state='uploaded'; obj.save(update_fields=['state'])
+            _complete_upload_session(obj, parts)
+        except (KeyError, TypeError, ValueError) as exc:
+            code=str(exc) or 'UPLOAD_PART_INVALID'
+            return Response({'code':code,'detail':'multipart reconciliation or integrity verification failed'}, status=409 if code in ('UPLOAD_PART_MISSING','STORAGE_RECONCILIATION_FAILED') else 422)
         except Exception as exc: return Response({'detail':str(exc)},status=400)
         return Response(UploadSessionSerializer(obj).data)
 
@@ -429,15 +460,41 @@ def storage_health(request):
     except Exception as exc: return Response({'status':'error','detail':str(exc)},status=503)
 
 @api_view(['GET'])
+def admin_health(request):
+    """Stable operational health envelope for the frozen admin contract."""
+    if user_role(request.user) not in ('admin', 'sysadmin'):
+        return Response({'code':'ROLE_REQUIRED','detail':'administrator role required'}, status=403)
+    db = {'status':'ok'}
+    try:
+        with connection.cursor() as cursor: cursor.execute('SELECT 1')
+    except Exception as exc: db = {'status':'error','detail':str(exc)}
+    storage = storage_health(request)
+    payload = {'status':'ok' if db['status']=='ok' and storage.status_code < 400 else 'degraded', 'database':db,
+               'object_storage': storage.data if hasattr(storage, 'data') else {'status':'error'}}
+    return Response(payload, status=200 if payload['status']=='ok' else 503)
+
+@api_view(['GET'])
+def admin_settings(request):
+    if user_role(request.user) not in ('admin', 'sysadmin'):
+        return Response({'code':'ROLE_REQUIRED','detail':'administrator role required'}, status=403)
+    return Response({'max_upload_bytes': settings.PLM_MAX_UPLOAD_BYTES, 'finalize_sync_threshold_seconds': settings.FINALIZE_SYNC_THRESHOLD,
+                     'multipart_part_bytes': 64 * 1024 * 1024, 'multipart_max_parts': 10000,
+                     's3_control_endpoint_configured': bool(settings.MINIO_ENDPOINT),
+                     's3_public_endpoint_configured': bool(settings.MINIO_PUBLIC_ENDPOINT)})
+
+@api_view(['GET'])
 def jobs_index(request):
     """Unified read-only job envelope used by the V1.6 workbench."""
     imports = ImportJob.objects.all().order_by('-created_at')[:100]
     exports = ExportJob.objects.all().order_by('-created_at')[:100]
+    finalizes = FinalizeJob.objects.all().order_by('-created_at')[:100]
     rows = []
     for job in imports:
         rows.append({'id': str(job.id), 'kind': 'import', 'status': job.status, 'created_at': job.created_at, 'summary': job.summary or {}})
     for job in exports:
         rows.append({'id': str(job.id), 'kind': 'export', 'status': job.status, 'created_at': job.created_at, 'summary': job.summary or {}})
+    for job in finalizes:
+        rows.append({'id': str(job.id), 'kind': 'finalize', 'status': job.status, 'created_at': job.created_at, 'summary': {'upload_session': str(job.upload_session_id), 'error': job.error}})
     rows.sort(key=lambda row: row['created_at'] or timezone.now(), reverse=True)
     return Response({'results': rows[:100], 'count': len(rows[:100])})
 
@@ -486,6 +543,3 @@ def ldap_login(request):
     elif user.groups.filter(name='engineer').exists(): role = 'engineer'
     elif user.groups.filter(name='reviewer').exists(): role = 'reviewer'
     return Response({'user':username,'role':role})
-
-
-

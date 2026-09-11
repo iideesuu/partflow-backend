@@ -113,11 +113,13 @@ class BOMRevision(models.Model):
 class BOMItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     bom_revision = models.ForeignKey(BOMRevision, related_name='items', on_delete=models.PROTECT)
+    parent_item = models.ForeignKey('self', null=True, blank=True, related_name='children', on_delete=models.PROTECT)
     line_no = models.PositiveIntegerField()
     child_part_revision = models.ForeignKey(PartRevision, on_delete=models.PROTECT)
     quantity = models.DecimalField(max_digits=18, decimal_places=6)
     unit = models.ForeignKey(Unit, on_delete=models.PROTECT, null=True, blank=True)
     position = models.CharField(max_length=128, default='__NO_POSITION__')
+    no_position_reason = models.CharField(max_length=255, blank=True)
     class Meta: constraints = [models.UniqueConstraint(fields=['bom_revision','line_no'], name='uniq_bom_line')]
 
 class UploadSession(models.Model):
@@ -174,3 +176,23 @@ class ExportJob(models.Model):
     filters = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+class FinalizeJob(models.Model):
+    """Durable asynchronous upload finalization handle."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    upload_session = models.ForeignKey(UploadSession, on_delete=models.PROTECT, related_name='finalize_jobs')
+    parts = models.JSONField(default=list)
+    status = models.CharField(max_length=20, default='queued')
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+
+class UserSecurity(models.Model):
+    user = models.OneToOneField('auth.User', primary_key=True, on_delete=models.CASCADE, related_name='security')
+    permission_version = models.PositiveIntegerField(default=1)
+    session_nonce = models.UUIDField(default=uuid.uuid4, editable=False)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    failed_attempts = models.PositiveIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)

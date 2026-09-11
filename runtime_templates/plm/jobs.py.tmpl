@@ -21,7 +21,7 @@ from django.utils import timezone
 
 from .models import (
     BOM, BOMItem, BOMRevision, Category, ImportJob, Part, PartRevision,
-    Unit, UploadSession, ExportJob,
+    Unit, UploadSession, ExportJob, FinalizeJob,
 )
 
 MAX_BYTES = 5 * 1024 * 1024
@@ -380,3 +380,19 @@ def export_download_url(job, expires=3600):
     if not job.object_key or job.status != "completed":
         return ""
     return s3_client().generate_presigned_url("get_object", Params={"Bucket": settings.MINIO_BUCKET_EXPORT, "Key": job.object_key}, ExpiresIn=expires)
+
+@shared_task(name='plm.finalize_upload_job')
+def finalize_upload_job(job_id):
+    """Run the same reconciliation/finalize path outside the request timeout."""
+    from .views import _complete_upload_session
+    job = FinalizeJob.objects.select_related('upload_session').get(pk=job_id)
+    if job.status == 'completed':
+        return {'status': job.status, 'upload_session': str(job.upload_session_id)}
+    try:
+        job.status = 'running'; job.save(update_fields=['status','updated_at'])
+        _complete_upload_session(job.upload_session, job.parts)
+        job.status = 'completed'; job.save(update_fields=['status','updated_at'])
+        return {'status': job.status, 'upload_session': str(job.upload_session_id)}
+    except Exception as exc:
+        job.status = 'failed'; job.error = str(exc); job.save(update_fields=['status','error','updated_at'])
+        raise

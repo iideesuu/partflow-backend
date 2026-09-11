@@ -1,4 +1,4 @@
-﻿from rest_framework import serializers
+from rest_framework import serializers
 from .models import *
 class CategorySerializer(serializers.ModelSerializer):
     code = serializers.ReadOnlyField()
@@ -66,28 +66,21 @@ class BOMItemSerializer(serializers.ModelSerializer):
     unit_code = serializers.CharField(source='unit.code', read_only=True)
     class Meta:
         model = BOMItem
-        fields = ['id','bom_revision','line_no','child_part_revision','child_part_code','child_revision','child_name','quantity','unit','unit_code','position']
+        fields = ['id','bom_revision','line_no','child_part_revision','child_part_code','child_revision','child_name','quantity','unit','unit_code','position','parent_item','no_position_reason']
         read_only_fields = ['id','child_part_code','child_revision','child_name','unit_code']
     def validate(self, attrs):
-        # EBOM rows are immutable once their revision leaves draft and may
-        # only reference released child revisions.  Keeping this check in the
-        # serializer protects both the REST endpoint and import workers.
         br = attrs.get('bom_revision') or getattr(self.instance, 'bom_revision', None)
         child = attrs.get('child_part_revision') or getattr(self.instance, 'child_part_revision', None)
-        if br is not None and br.revision_state != 'draft':
-            raise serializers.ValidationError({'bom_revision': 'BOM revision is immutable outside draft state'})
-        if child is not None and child.revision_state != 'released':
-            raise serializers.ValidationError({'child_part_revision': 'referenced revision must be released'})
         quantity = attrs.get('quantity', getattr(self.instance, 'quantity', None))
-        if quantity is None or quantity <= 0:
-            raise serializers.ValidationError({'quantity': 'must be greater than zero'})
         position = attrs.get('position', getattr(self.instance, 'position', '__NO_POSITION__'))
-        if br is not None and position and position != '__NO_POSITION__':
-            qs = BOMItem.objects.filter(bom_revision=br, position=position)
-            if self.instance is not None:
-                qs = qs.exclude(pk=self.instance.pk)
-            if qs.exists():
-                raise serializers.ValidationError({'position': 'position must be unique within a BOM revision'})
+        parent = attrs.get('parent_item', getattr(self.instance, 'parent_item', None))
+        reason = attrs.get('no_position_reason', getattr(self.instance, 'no_position_reason', ''))
+        if position == '__NO_POSITION__' and not str(reason or '').strip():
+            raise serializers.ValidationError({'no_position_reason': 'reason is required when position is omitted'})
+        from .bom_services import validate_bom_item
+        validate_bom_item(bom_revision=br, child_part_revision=child, quantity=quantity,
+                          unit=attrs.get('unit', getattr(self.instance, 'unit', None)),
+                          parent_item=parent, position=position, instance=self.instance)
         return attrs
 class BOMRevisionSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True, read_only=True)

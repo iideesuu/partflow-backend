@@ -1,0 +1,65 @@
+from unittest.mock import patch
+
+from django.contrib.auth.models import Group, User
+from django.core.cache import cache
+from django.test import TestCase
+import json
+from rest_framework.test import APIClient
+
+from .models import Category, UserSecurity
+from .roles import assign_role
+
+
+class AuthSecurityTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.password = 'correct-password-123'
+        self.user = User.objects.create_user(username='operator', password=self.password)
+        self.user.groups.add(Group.objects.get_or_create(name='plm:engineer')[0])
+        UserSecurity.objects.create(user=self.user)
+
+    def test_five_invalid_logins_are_locked_and_return_retry_after(self):
+        for _ in range(4):
+            response = self.client.post('/api/v1/auth/login/', {'username': self.user.username, 'password': 'bad'}, format='json')
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json()['code'], 'AUTH_INVALID')
+        response = self.client.post('/api/v1/auth/login/', {'username': self.user.username, 'password': 'bad'}, format='json')
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(json.loads(response.content)['code'], 'RATE_LIMITED')
+        self.assertIn('Retry-After', response.headers)
+        self.assertGreater(int(response.headers['Retry-After']), 0)
+        response = self.client.post('/api/v1/auth/login/', {'username': self.user.username, 'password': self.password}, format='json')
+        self.assertEqual(response.status_code, 429)
+
+    def test_assign_role_preserves_unrelated_groups_and_bumps_version(self):
+        actor = User.objects.create_user(username='admin')
+        actor.groups.add(Group.objects.get_or_create(name='plm:admin')[0])
+        target_group = Group.objects.get_or_create(name='external:directory-reader')[0]
+        self.user.groups.add(target_group)
+        security = UserSecurity.objects.get(user=self.user)
+        before = security.permission_version
+        assign_role(actor, self.user.username, 'reviewer')
+        self.user.refresh_from_db(); security.refresh_from_db()
+        self.assertTrue(self.user.groups.filter(name='external:directory-reader').exists())
+        self.assertTrue(self.user.groups.filter(name='plm:reviewer').exists())
+        self.assertFalse(self.user.groups.filter(name='plm:engineer').exists())
+        self.assertEqual(security.permission_version, before + 1)
+
+    def test_sysadmin_cannot_write_business_categories(self):
+        sysadmin = User.objects.create_user(username='sysadmin')
+        sysadmin.groups.add(Group.objects.get_or_create(name='plm:sysadmin')[0])
+        self.client.force_authenticate(sysadmin)
+        response = self.client.post('/api/v1/categories/', {'major_code': '98', 'minor_code': '01', 'name': 'No write'}, format='json')
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Category.objects.filter(name='No write').exists())
+
+    def test_session_is_invalid_after_permission_version_revoke(self):
+        response = self.client.post('/api/v1/auth/login/', {'username': self.user.username, 'password': self.password}, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        security = UserSecurity.objects.get(user=self.user)
+        security.permission_version += 1
+        security.save(update_fields=['permission_version', 'updated_at'])
+        response = self.client.get('/api/v1/auth/me/')
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()['code'], 'AUTH_INVALID')

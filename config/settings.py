@@ -3,7 +3,7 @@ from pathlib import Path
 BASE_DIR=Path(__file__).resolve().parent.parent
 SECRET_KEY=os.getenv('DJANGO_SECRET_KEY','dev'); DEBUG=os.getenv('DJANGO_DEBUG','1')=='1'; ALLOWED_HOSTS=os.getenv('DJANGO_ALLOWED_HOSTS','*').split(',')
 INSTALLED_APPS=['django.contrib.auth','django.contrib.contenttypes','django.contrib.sessions','django.contrib.staticfiles','rest_framework','drf_spectacular','plm']
-MIDDLEWARE=['django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','config.etag_middleware.ETagMiddleware']
+MIDDLEWARE=['django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','plm.security_middleware.SessionSecurityMiddleware','config.etag_middleware.ETagMiddleware']
 ROOT_URLCONF='config.urls'; WSGI_APPLICATION='config.wsgi.application'; USE_TZ=True; TIME_ZONE='Asia/Shanghai'; DEFAULT_AUTO_FIELD='django.db.models.BigAutoField'
 TEMPLATES=[{'BACKEND':'django.template.backends.django.DjangoTemplates','DIRS':[],'APP_DIRS':True,'OPTIONS':{'context_processors':['django.template.context_processors.request','django.contrib.auth.context_processors.auth','django.contrib.messages.context_processors.messages']}}]
 _db = {'ENGINE':'django.db.backends.postgresql','NAME':os.getenv('POSTGRES_DB','partflow'),'USER':os.getenv('POSTGRES_USER','partflow'),'PASSWORD':os.getenv('POSTGRES_PASSWORD',''),'HOST':os.getenv('POSTGRES_HOST','db'),'PORT':os.getenv('POSTGRES_PORT','5432')}
@@ -17,6 +17,11 @@ MINIO_ENDPOINT=os.getenv('MINIO_S3_CONTROL_ENDPOINT') or os.getenv('MINIO_ENDPOI
 STATIC_URL='/static/'; STATIC_ROOT=BASE_DIR/'staticfiles'; CELERY_BROKER_URL=os.getenv('REDIS_URL','redis://redis:6379/1'); CELERY_RESULT_BACKEND=CELERY_BROKER_URL
 PLM_MAX_UPLOAD_BYTES=int(os.getenv('PLM_MAX_UPLOAD_BYTES','5368709120')); DATA_UPLOAD_MAX_MEMORY_SIZE=80*1024*1024; FILE_UPLOAD_MAX_MEMORY_SIZE=10*1024*1024; MEDIA_ROOT=None
 FINALIZE_SYNC_THRESHOLD=int(os.getenv('FINALIZE_SYNC_THRESHOLD','5'))
+SESSION_COOKIE_AGE=int(os.getenv('SESSION_ABSOLUTE_TIMEOUT','43200'))
+SESSION_IDLE_TIMEOUT=int(os.getenv('SESSION_IDLE_TIMEOUT','1800'))
+PERMISSION_TTL=int(os.getenv('PERMISSION_TTL','300'))
+LOGIN_FAIL_LOCK_THRESHOLD=int(os.getenv('LOGIN_FAIL_LOCK_THRESHOLD','5'))
+LOGIN_FAIL_LOCK_WINDOW=int(os.getenv('LOGIN_FAIL_LOCK_WINDOW','900'))
 PLM_PRODUCTION=os.getenv('PLM_PRODUCTION','0').lower() in ('1','true','yes','on')
 if PLM_PRODUCTION:
     if SECRET_KEY == 'dev' or len(SECRET_KEY) < 50:
@@ -32,4 +37,3 @@ if PLM_PRODUCTION:
     if MINIO_PUBLIC_ENDPOINT == MINIO_ENDPOINT:
         raise RuntimeError('MINIO_S3_PUBLIC_ENDPOINT must differ from MINIO_S3_CONTROL_ENDPOINT')
 CSRF_TRUSTED_ORIGINS=[u.strip() for u in os.getenv('DJANGO_CSRF_TRUSTED_ORIGINS','http://localhost,http://localhost:5173,http://localhost:8000').split(',') if u.strip()]
-
