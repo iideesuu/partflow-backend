@@ -22,6 +22,7 @@ class SessionSecurityMiddleware:
                 request.session.get('session_nonce', str(security.session_nonce)) != str(security.session_nonce)
                 or request.session.get('permission_version', security.permission_version) != security.permission_version
                 or security.revoked_at is not None
+                or not request.user.is_active
                 or now - started >= settings.SESSION_COOKIE_AGE
                 or now - last_seen >= settings.SESSION_IDLE_TIMEOUT
             )

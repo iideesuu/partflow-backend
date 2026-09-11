@@ -90,9 +90,9 @@ def health_ready(request):
     except Exception as exc: return JsonResponse({'status':'error','detail':str(exc)}, status=503)
 
 class CategoryViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
-    write_roles = ('admin',)
+    write_roles = ('admin','sysadmin')
     delete_roles = ('admin',)
-    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    read_roles = ('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
     queryset = Category.objects.all(); serializer_class = CategorySerializer
     @action(detail=False, methods=['post'], url_path='import')
     def import_rows(self, request):
@@ -123,9 +123,9 @@ class CategoryViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet
             return Response({'detail':'category is used by parts and cannot be deleted; disable it instead'}, status=status.HTTP_409_CONFLICT)
 
 class UnitViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
-    write_roles = ('admin',)
+    write_roles = ('admin','sysadmin')
     delete_roles = ('admin',)
-    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    read_roles = ('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
     def destroy(self, request, *args, **kwargs):
         try:
             return super().destroy(request, *args, **kwargs)
@@ -135,7 +135,7 @@ class UnitViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
 class PartViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
     write_roles = ('engineer','admin')
     delete_roles = ('admin',)
-    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    read_roles = ('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
     queryset = Part.objects.select_related('category').prefetch_related('revisions'); serializer_class = PartSerializer
     def get_queryset(self):
         qs = super().get_queryset(); p=self.request.query_params
@@ -234,7 +234,7 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         return Response(BOMItemSerializer(obj).data,status=201)
 
 class NumberRequestViewSet(RoleProtectedMixin, viewsets.ViewSet):
-    read_roles=('viewer','engineer','reviewer','publisher','admin'); write_roles=('engineer','admin')
+    read_roles=('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin'); write_roles=('engineer','admin')
     def list(self, request):
         return Response({'rule':'NNNN-NNNNN','sources':list(NumberSource.objects.filter(is_enabled=True).values('id','name','url')), 'requests':NumberRequestSerializer(NumberRequest.objects.order_by('-id')[:100],many=True).data})
     def create(self, request):
@@ -244,7 +244,7 @@ class NumberRequestViewSet(RoleProtectedMixin, viewsets.ViewSet):
         return Response({'code':'NUMBER_ALLOCATOR_REMOVED','detail':'PLM does not allocate part numbers'}, status=410)
 
 class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
-    write_roles=('engineer','admin'); read_roles=('viewer','engineer','reviewer','publisher','admin')
+    write_roles=('engineer','admin'); read_roles=('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
     action_roles={'transition':('engineer','reviewer','publisher','admin'),'actions':('engineer','reviewer','publisher','admin')}
     http_method_names=['get','post','put','patch','head','options']
     serializer_class=PartRevisionSerializer
@@ -315,7 +315,7 @@ class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         return self.transition(request, pk=pk, **kwargs)
 
 class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
-    write_roles=('engineer','admin'); read_roles=('viewer','engineer','reviewer','publisher','admin'); serializer_class=PartAttachmentSerializer
+    write_roles=('engineer','admin'); read_roles=('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin'); serializer_class=PartAttachmentSerializer
     def get_queryset(self): return PartAttachment.objects.filter(revision__part_id=self.kwargs['part_pk']).select_related('upload_session')
     def lock_draft_revision(self, revision):
         part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
@@ -347,7 +347,7 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         obj=self.get_object(); url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
 
 class AuditEventViewSet(RoleProtectedMixin, viewsets.ReadOnlyModelViewSet):
-    read_roles=('admin','reviewer','publisher'); queryset=AuditEvent.objects.all(); serializer_class=AuditEventSerializer
+    read_roles=('admin','reviewer','publisher','auditor','sysadmin'); queryset=AuditEvent.objects.all(); serializer_class=AuditEventSerializer
     def get_queryset(self):
         qs=super().get_queryset(); p=self.request.query_params
         for key in ('action','resource_type','actor','resource_id'):

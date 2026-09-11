@@ -9,9 +9,9 @@ ROLE_ALIASES={'release_manager':'publisher'}
 ROLE_PERMISSIONS={'viewer':{'parts.read','bom.read','attachments.read'},'engineer':{'parts.read','parts.create','parts.edit','bom.read','bom.edit','attachments.upload','imports.create'},'reviewer':{'parts.read','bom.read','attachments.read','review.submit','review.decide'},'publisher':{'parts.read','bom.read','review.read','release.publish','attachments.read'},'auditor':{'parts.read','bom.read','attachments.read','audit.read'},'sysadmin':set(),'admin':set()}
 
 def user_role(user):
+    if not getattr(user,'is_authenticated',False) or not getattr(user,'is_active',False): return None
     if getattr(user,'is_superuser',False): return 'admin'
-    if not getattr(user,'is_authenticated',False): return None
-    raw=next((g.name[4:] for g in user.groups.all() if g.name.startswith('plm:')),None)
+    raw=next((g.name[4:] for g in user.groups.filter(name__startswith='plm:').order_by('name') if g.name[4:] in ROLES or g.name[4:] in ROLE_ALIASES),None)
     return ROLE_ALIASES.get(raw,raw)
 
 def has_permission(user,permission): return permission in ROLE_PERMISSIONS.get(user_role(user),set())

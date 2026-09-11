@@ -8,6 +8,7 @@ from rest_framework.test import APIClient
 
 from .models import Category, UserSecurity
 from .roles import assign_role
+from .auth import LDAPIdentity, shadow_user
 
 
 class AuthSecurityTests(TestCase):
@@ -63,3 +64,12 @@ class AuthSecurityTests(TestCase):
         response = self.client.get('/api/v1/auth/me/')
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()['code'], 'AUTH_INVALID')
+
+    def test_shadow_user_never_reactivates_local_disabled_account(self):
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+        identity = LDAPIdentity(username=self.user.username, dn='uid=operator,dc=example,dc=org')
+        with self.assertRaisesMessage(ValueError, 'user is disabled locally'):
+            shadow_user(identity)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)

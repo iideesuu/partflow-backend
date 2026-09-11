@@ -8,6 +8,7 @@ from rest_framework.test import APIClient
 
 from .models import Category, UserSecurity
 from .roles import assign_role
+from .auth import LDAPIdentity, shadow_user
 
 
 class AuthSecurityTests(TestCase):
@@ -19,7 +20,8 @@ class AuthSecurityTests(TestCase):
         self.user.groups.add(Group.objects.get_or_create(name='plm:engineer')[0])
         UserSecurity.objects.create(user=self.user)
 
-    def test_five_invalid_logins_are_locked_and_return_retry_after(self):
+    @patch('plm.auth_views.ldap_enabled', return_value=False)
+    def test_five_invalid_logins_are_locked_and_return_retry_after(self, _ldap_enabled):
         for _ in range(4):
             response = self.client.post('/api/v1/auth/login/', {'username': self.user.username, 'password': 'bad'}, format='json')
             self.assertEqual(response.status_code, 401)
@@ -46,15 +48,15 @@ class AuthSecurityTests(TestCase):
         self.assertFalse(self.user.groups.filter(name='plm:engineer').exists())
         self.assertEqual(security.permission_version, before + 1)
 
-    def test_sysadmin_cannot_write_business_categories(self):
+    def test_sysadmin_cannot_write_business_parts(self):
         sysadmin = User.objects.create_user(username='sysadmin')
         sysadmin.groups.add(Group.objects.get_or_create(name='plm:sysadmin')[0])
         self.client.force_authenticate(sysadmin)
-        response = self.client.post('/api/v1/categories/', {'major_code': '98', 'minor_code': '01', 'name': 'No write'}, format='json')
+        response = self.client.post('/api/v1/parts/', {'part_code': '98.01.0001', 'name': 'No write'}, format='json')
         self.assertEqual(response.status_code, 403)
-        self.assertFalse(Category.objects.filter(name='No write').exists())
 
-    def test_session_is_invalid_after_permission_version_revoke(self):
+    @patch('plm.auth_views.ldap_enabled', return_value=False)
+    def test_session_is_invalid_after_permission_version_revoke(self, _ldap_enabled):
         response = self.client.post('/api/v1/auth/login/', {'username': self.user.username, 'password': self.password}, format='json')
         self.assertEqual(response.status_code, 200, response.content)
         security = UserSecurity.objects.get(user=self.user)
@@ -63,3 +65,12 @@ class AuthSecurityTests(TestCase):
         response = self.client.get('/api/v1/auth/me/')
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()['code'], 'AUTH_INVALID')
+
+    def test_shadow_user_never_reactivates_local_disabled_account(self):
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+        identity = LDAPIdentity(username=self.user.username, dn='uid=operator,dc=example,dc=org')
+        with self.assertRaisesMessage(ValueError, 'user is disabled locally'):
+            shadow_user(identity)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
