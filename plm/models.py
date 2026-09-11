@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 from django.db import models
 
 class Category(models.Model):

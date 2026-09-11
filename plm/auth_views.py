@@ -1,0 +1,49 @@
+﻿import json, os
+from django.contrib.auth import authenticate as django_authenticate, login, logout, get_user_model
+from django.http import JsonResponse
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.decorators.http import require_http_methods
+from .auth import authenticate as ldap_authenticate, shadow_user, ldap_enabled
+from .roles import user_role, assign_role, ROLES
+
+def _payload(user):
+    role=user_role(user)
+    return {'username':user.username,'display_name':user.first_name,'role':role}
+
+@ensure_csrf_cookie
+@require_http_methods(['GET'])
+def csrf(request): return JsonResponse({'detail':'ok'})
+
+@ensure_csrf_cookie
+@require_http_methods(['GET','POST'])
+def login_view(request):
+    if request.method == 'GET':
+        return JsonResponse({'detail':'login endpoint','method':'POST','fields':['username','password'],'csrf':'GET /api/v1/auth/csrf/ first'})
+    try: data=json.loads(request.body or '{}')
+    except ValueError: return JsonResponse({'detail':'invalid JSON'},status=400)
+    if ldap_enabled():
+        try: user=shadow_user(ldap_authenticate(data.get('username',''),data.get('password','')))
+        except Exception: return JsonResponse({'detail':'LDAP authentication failed'},status=401)
+    else:
+        user=django_authenticate(request,username=data.get('username',''),password=data.get('password',''))
+        if not user: return JsonResponse({'detail':'invalid credentials'},status=401)
+    login(request,user,backend='django.contrib.auth.backends.ModelBackend')
+    result=_payload(user); return JsonResponse({'role':result['role'],'user':result})
+
+@ensure_csrf_cookie
+@require_http_methods(['GET'])
+def me(request):
+    if not request.user.is_authenticated: return JsonResponse({'authenticated':False},status=401)
+    result=_payload(request.user); return JsonResponse({'authenticated':True,'role':result['role'],'user':result})
+
+@require_http_methods(['POST'])
+def logout_view(request): logout(request); return JsonResponse({'detail':'logged out'})
+
+@require_http_methods(['GET','POST'])
+def users(request):
+    if not request.user.is_authenticated or user_role(request.user)!='admin': return JsonResponse({'detail':'permission denied'},status=403)
+    User=get_user_model()
+    if request.method=='GET': return JsonResponse({'roles':ROLES,'users':[{'username':u.username,'active':u.is_active,'role':user_role(u)} for u in User.objects.order_by('username')]})
+    try: data=json.loads(request.body or '{}'); target=assign_role(request.user,data['username'],data['role'])
+    except (KeyError,ValueError,PermissionError,User.DoesNotExist) as exc: return JsonResponse({'detail':str(exc)},status=400)
+    return JsonResponse({'user':_payload(target)})

@@ -1,6 +1,7 @@
 ﻿from rest_framework.routers import DefaultRouter
 from django.urls import path, include
-from .views import CategoryViewSet, UnitViewSet, PartViewSet, BOMViewSet, UploadSessionViewSet, ImportJobViewSet, ExportJobViewSet, storage_health, NumberRequestViewSet, PartRevisionViewSet, PartAttachmentViewSet, AuditEventViewSet, bom_revision_actions
+from .views import CategoryViewSet, UnitViewSet, PartViewSet, BOMViewSet, UploadSessionViewSet, ImportJobViewSet, ExportJobViewSet, storage_health, jobs_index, NumberRequestViewSet, PartRevisionViewSet, PartAttachmentViewSet, AuditEventViewSet, bom_revision_actions
+from .auth_views import csrf, login_view, me, logout_view, users
 router = DefaultRouter()
 router.register('categories', CategoryViewSet, basename='category')
 router.register('units', UnitViewSet, basename='unit')
@@ -13,5 +14,5 @@ router.register('numbers', NumberRequestViewSet, basename='number')
 router.register('audit', AuditEventViewSet, basename='audit')
 router.register('parts/(?P<part_pk>[^/.]+)/revisions', PartRevisionViewSet, basename='part-revision')
 router.register('parts/(?P<part_pk>[^/.]+)/attachments', PartAttachmentViewSet, basename='part-attachment')
-urlpatterns = [path('', include(router.urls)), path('storage/health/', storage_health), path('bom-revisions/<uuid:pk>/actions/', bom_revision_actions)]
+urlpatterns = [path('', include(router.urls)), path('storage/health/', storage_health), path('jobs/', jobs_index), path('bom-revisions/<uuid:pk>/actions/', bom_revision_actions), path('auth/csrf/', csrf), path('auth/login/', login_view), path('auth/me/', me), path('auth/logout/', logout_view), path('auth/users/', users)]
 

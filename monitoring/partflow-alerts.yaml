@@ -1,0 +1,29 @@
+﻿groups:
+  - name: partflow.m3
+    interval: 30s
+    rules:
+      - alert: PartFlowApiHighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.02
+        for: 5m
+        labels: {severity: page}
+        annotations: {summary: "PLM/BOM API 5xx rate above 2%", runbook: "docs/monitoring/README.md"}
+      - alert: PartFlowDependencyUnavailable
+        expr: partflow_dependency_health == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "A required dependency is unavailable", action: "fail closed writes"}
+      - alert: PartFlowDiskCapacity
+        expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.20
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Storage free space below 20%"}
+      - alert: PartFlowDiskCritical
+        expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.10
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Storage free space below 10%; pause uploads"}
+      - alert: PartFlowCeleryDeadLetters
+        expr: partflow_celery_dead_letter_total > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Celery dead-letter queue is non-empty"}

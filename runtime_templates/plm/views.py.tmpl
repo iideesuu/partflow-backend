@@ -428,6 +428,19 @@ def storage_health(request):
         c=s3_client(); buckets=[settings.MINIO_BUCKET_QUARANTINE,settings.MINIO_BUCKET_DRAFT,settings.MINIO_BUCKET_RELEASE,settings.MINIO_BUCKET_EXPORT]; [c.head_bucket(Bucket=b) for b in buckets]; return Response({'status':'ok','endpoint':settings.MINIO_ENDPOINT,'buckets':buckets})
     except Exception as exc: return Response({'status':'error','detail':str(exc)},status=503)
 
+@api_view(['GET'])
+def jobs_index(request):
+    """Unified read-only job envelope used by the V1.6 workbench."""
+    imports = ImportJob.objects.all().order_by('-created_at')[:100]
+    exports = ExportJob.objects.all().order_by('-created_at')[:100]
+    rows = []
+    for job in imports:
+        rows.append({'id': str(job.id), 'kind': 'import', 'status': job.status, 'created_at': job.created_at, 'summary': job.summary or {}})
+    for job in exports:
+        rows.append({'id': str(job.id), 'kind': 'export', 'status': job.status, 'created_at': job.created_at, 'summary': job.summary or {}})
+    rows.sort(key=lambda row: row['created_at'] or timezone.now(), reverse=True)
+    return Response({'results': rows[:100], 'count': len(rows[:100])})
+
 @api_view(['POST'])
 @transaction.atomic
 def bom_revision_actions(request, pk=None):

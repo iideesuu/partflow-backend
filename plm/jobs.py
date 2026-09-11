@@ -1,4 +1,4 @@
-"""MinIO backed import/export jobs.
+﻿"""MinIO backed import/export jobs.
 
 The API stores only an UploadSession and dispatches these tasks to Celery.  A
 worker reads the object directly from MinIO; no input or output file is ever
@@ -27,7 +27,7 @@ from .models import (
 MAX_BYTES = 5 * 1024 * 1024
 MAX_ERRORS = 1000
 
-# Spreadsheet formula injection guard mandated by V1.6 §6.5.4.  Prefix
+# Spreadsheet formula injection guard mandated by V1.6 搂6.5.4.  Prefix
 # dangerous leading characters with a single quote while preserving the
 # original text for all ordinary cells.  Apply to every generated CSV/JSON
 # artifact because JSON is routinely converted to spreadsheets by users.

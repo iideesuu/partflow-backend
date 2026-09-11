@@ -1,0 +1,178 @@
+﻿openapi: 3.1.0
+info:
+  title: PartFlow PLM/BOM API
+  version: 1.6.0
+  description: M0-M3 contract baseline for review. Deployment endpoints and credentials are supplied by environment variables.
+servers:
+  - url: /api/v1
+security:
+  - sessionCookie: []
+tags:
+  - name: Auth
+  - name: Parts
+  - name: Revisions
+  - name: BOM
+  - name: Attachments
+  - name: Jobs
+  - name: Admin
+paths:
+  /auth/login:
+    post:
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/LoginRequest'}}}
+      responses:
+        '200': {description: Session created, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}
+        '401': {$ref: '#/components/responses/AuthInvalid'}
+  /auth/logout:
+    post:
+      operationId: logout
+      responses: {'200': {description: Session revoked}}
+  /categories:
+    get:
+      operationId: listCategories
+      parameters:
+        - {$ref: '#/components/parameters/CatalogVersion'}
+        - {name: major_code, in: query, schema: {type: string, pattern: '^[0-9]{2}$'}}
+      responses: {'200': {description: Category list, content: {application/json: {schema: {$ref: '#/components/schemas/CategoryList'}}}}}
+    post:
+      operationId: importCategories
+      description: Asynchronous CSV/JSON import; returns a job and requires confirmation token for commit.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CategoryImport'}}}}
+      responses: {'202': {$ref: '#/components/responses/JobAccepted'}, '422': {$ref: '#/components/responses/ValidationError'}}
+  /parts:
+    get:
+      operationId: listParts
+      parameters: [{name: q, in: query, schema: {type: string}}, {name: revision_state, in: query, schema: {$ref: '#/components/schemas/RevisionState'}}]
+      responses: {'200': {description: Part list, content: {application/json: {schema: {$ref: '#/components/schemas/PartList'}}}}}
+    post:
+      operationId: createPart
+      parameters: [{name: Idempotency-Key, in: header, required: true, schema: {type: string}}, {name: X-Catalog-Version, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PartCreate'}}}}
+      responses: {'201': {description: Created, headers: {Location: {schema: {type: string}}, ETag: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Part'}}}}, '409': {$ref: '#/components/responses/Conflict'}, '422': {$ref: '#/components/responses/ValidationError'}}
+  /parts/{part_id}/revisions:
+    parameters: [{name: part_id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: listPartRevisions
+      responses: {'200': {description: Revision list, content: {application/json: {schema: {$ref: '#/components/schemas/RevisionList'}}}}}
+    post:
+      operationId: createPartRevision
+      parameters: [{name: Idempotency-Key, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RevisionCreate'}}}}
+      responses: {'201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/Revision'}}}}, '409': {$ref: '#/components/responses/Conflict'}}
+  /part-revisions/{revision_id}/actions:
+    parameters: [{name: revision_id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: transitionRevision
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RevisionAction'}}}}
+      responses: {'200': {description: Transition result, content: {application/json: {schema: {$ref: '#/components/schemas/Revision'}}}}, '409': {$ref: '#/components/responses/Conflict'}}
+  /boms:
+    get:
+      operationId: listBoms
+      responses: {'200': {description: BOM list, content: {application/json: {schema: {$ref: '#/components/schemas/BomList'}}}}}
+    post:
+      operationId: createBom
+      parameters: [{name: Idempotency-Key, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BomCreate'}}}}
+      responses: {'201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/Bom'}}}}}
+  /bom-revisions/{revision_id}/tree:
+    get:
+      operationId: getBomTree
+      parameters: [{name: revision_id, in: path, required: true, schema: {type: string, format: uuid}}, {name: depth, in: query, schema: {type: integer, maximum: 20}}]
+      responses: {'200': {description: BOM tree, content: {application/json: {schema: {$ref: '#/components/schemas/BomTree'}}}}}
+  /bom-revisions/{revision_id}/items:
+    parameters: [{name: revision_id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: addBomItem
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}, {name: Idempotency-Key, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BomItemCreate'}}}}
+      responses: {'201': {description: Item created, content: {application/json: {schema: {$ref: '#/components/schemas/BomItem'}}}}, '409': {$ref: '#/components/responses/Conflict'}, '422': {$ref: '#/components/responses/ValidationError'}}
+  /attachments/upload-sessions:
+    post:
+      operationId: createUploadSession
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UploadSessionCreate'}}}}
+      responses: {'201': {description: Session and presigned URLs, content: {application/json: {schema: {$ref: '#/components/schemas/UploadSession'}}}}, '413': {description: Size exceeded}}
+  /attachments/upload-sessions/{session_id}/finalize:
+    post:
+      operationId: finalizeUpload
+      parameters: [{name: session_id, in: path, required: true, schema: {type: string, format: uuid}}, {name: Idempotency-Key, in: header, required: true, schema: {type: string}}]
+      responses: {'200': {description: Finalized, content: {application/json: {schema: {$ref: '#/components/schemas/AttachmentVersion'}}}}, '202': {$ref: '#/components/responses/JobAccepted'}, '409': {$ref: '#/components/responses/Conflict'}}
+  /attachment-versions/{attachment_id}/download:
+    get:
+      operationId: requestAttachmentDownload
+      parameters: [{name: attachment_id, in: path, required: true, schema: {type: string, format: uuid}}, {name: mode, in: query, required: true, schema: {type: string, enum: [current, draft, historical]}}, {name: as_of, in: query, schema: {type: string, format: date-time}}, {name: request_nonce, in: query, required: true, schema: {type: string}}]
+      responses: {'200': {description: Presigned download URL, content: {application/json: {schema: {$ref: '#/components/schemas/DownloadResponse'}}}}, '404': {$ref: '#/components/responses/NotFound'}}
+  /jobs/{job_id}:
+    get:
+      operationId: getJob
+      parameters: [{name: job_id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: Job status, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}}
+  /admin/health:
+    get:
+      operationId: adminHealth
+      responses: {'200': {description: Dependency health, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}}}}, '503': {description: Dependency unavailable}}
+  /admin/users/{user_id}:
+    patch:
+      operationId: assignUserRole
+      parameters: [{name: user_id, in: path, required: true, schema: {type: string, format: uuid}}, {name: If-Match, in: header, required: true, schema: {type: string}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RoleAssignment'}}}}
+      responses: {'200': {description: Updated user}, '409': {$ref: '#/components/responses/Conflict'}}
+  /audit-events:
+    get:
+      operationId: listAuditEvents
+      parameters: [{name: request_id, in: query, schema: {type: string}}, {name: job_id, in: query, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: Audit events}}
+  /numbering/next-number:
+    get:
+      operationId: removedNumberAllocator
+      security: []
+      responses: {'410': {description: Removed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}}
+    post:
+      operationId: removedNumberAllocatorPost
+      security: []
+      responses: {'410': {description: Removed}}
+components:
+  securitySchemes:
+    sessionCookie: {type: apiKey, in: cookie, name: sessionid}
+    csrfHeader: {type: apiKey, in: header, name: X-CSRFToken}
+  parameters:
+    CatalogVersion: {name: catalog_version, in: query, schema: {type: string}}
+  responses:
+    JobAccepted: {description: Accepted, headers: {Location: {schema: {type: string}}, Retry-After: {schema: {type: integer, example: 2}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+    Conflict: {description: Conflict, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    ValidationError: {description: Validation error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    NotFound: {description: Resource not found, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    AuthInvalid: {description: Authentication failed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  schemas:
+    Error: {type: object, required: [code, message, request_id, retryable], properties: {code: {type: string}, message: {type: string}, request_id: {type: string}, retryable: {type: boolean}, details: {type: object}}}
+    RevisionState: {type: string, enum: [draft, pending_review, rejected, approved, release_pending, released, release_failed, obsolete]}
+    LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
+    Session: {type: object, properties: {access_token: {type: string}, expires_at: {type: string, format: date-time}, permission_version: {type: integer}}}
+    Category: {type: object, required: [major_code, minor_code, name, catalog_version], properties: {id: {type: string, format: uuid}, major_code: {type: string}, minor_code: {type: string}, name: {type: string}, path: {type: string}, is_selectable: {type: boolean}, catalog_version: {type: string}, is_enabled: {type: boolean}}}
+    CategoryList: {type: object, properties: {results: {type: array, items: {$ref: '#/components/schemas/Category'}}, catalog_version: {type: string}}}
+    CategoryImport: {type: object, required: [upload_session_id, catalog_version, confirm_token], properties: {upload_session_id: {type: string, format: uuid}, catalog_version: {type: string}, confirm_token: {type: string}}}
+    PartCreate: {type: object, required: [part_code, category_id, number_request_id], properties: {part_code: {type: string, pattern: '^[0-9]{4}-[0-9]{5}$'}, category_id: {type: string, format: uuid}, number_request_id: {type: string, format: uuid}, catalog_version: {type: string}}}
+    Part: {allOf: [{type: object, properties: {id: {type: string, format: uuid}, part_code: {type: string}, row_version: {type: integer}}}]}
+    PartList: {type: object, properties: {results: {type: array, items: {$ref: '#/components/schemas/Part'}}}}
+    RevisionCreate: {type: object, required: [name], properties: {name: {type: string}, description: {type: string}, kind: {type: string}}}
+    Revision: {type: object, required: [id, revision, revision_state], properties: {id: {type: string, format: uuid}, revision: {type: string}, revision_state: {$ref: '#/components/schemas/RevisionState'}, row_version: {type: integer}, effective_range: {type: string}}}
+    RevisionList: {type: object, properties: {results: {type: array, items: {$ref: '#/components/schemas/Revision'}}}}
+    RevisionAction: {type: object, required: [action], properties: {action: {type: string, enum: [submit, approve, reject, publish, retry_publish, retire]}, comment: {type: string}}}
+    BomCreate: {type: object, required: [name, root_part_revision_id], properties: {name: {type: string}, root_part_revision_id: {type: string, format: uuid}, bom_type: {type: string, enum: [EBOM]}}}
+    Bom: {type: object, properties: {id: {type: string, format: uuid}, bom_code: {type: string, pattern: '^BOM-[0-9]{6}$'}, name: {type: string}}}
+    BomList: {type: object, properties: {results: {type: array, items: {$ref: '#/components/schemas/Bom'}}}}
+    BomItemCreate: {type: object, required: [line_no, child_part_revision_id, quantity, unit_id], properties: {line_no: {type: integer, minimum: 1}, child_part_revision_id: {type: string, format: uuid}, quantity: {type: number, exclusiveMinimum: 0}, unit_id: {type: string, format: uuid}, position: {type: string}, alternative_group_id: {type: string}, alternative_role: {type: string, enum: [primary, alternate]}, priority: {type: integer, minimum: 1}}}
+    BomItem: {allOf: [{type: object, properties: {id: {type: string, format: uuid}, line_no: {type: integer}}}]}
+    BomTree: {type: object, properties: {revision_id: {type: string}, nodes: {type: array, items: {type: object}}}}
+    UploadSessionCreate: {type: object, required: [filename, size, declared_sha256, attachment_role], properties: {filename: {type: string}, size: {type: integer, minimum: 1}, declared_sha256: {type: string, pattern: '^[a-fA-F0-9]{64}$'}, attachment_role: {type: string}, total_chunks: {type: integer, minimum: 1}}}
+    UploadSession: {type: object, properties: {id: {type: string, format: uuid}, upload_id: {type: string}, parts: {type: array, items: {type: object}}, expires_at: {type: string, format: date-time}}}
+    AttachmentVersion: {type: object, properties: {id: {type: string, format: uuid}, sha256: {type: string}, scan_status: {type: string, enum: [pending, clean, rejected]}, storage_stage: {type: string}}}
+    DownloadResponse: {type: object, required: [url, expires_at], properties: {url: {type: string, format: uri}, expires_at: {type: string, format: date-time}, version_id: {type: string}}}
+    Job: {type: object, properties: {id: {type: string, format: uuid}, status: {type: string, enum: [queued, running, succeeded, failed, cancelled]}, progress: {type: number}, error_code: {type: string}}}
+    Health: {type: object, properties: {status: {type: string, enum: [ok, degraded, unavailable]}, dependencies: {type: object, additionalProperties: {type: string}}}}
+    RoleAssignment: {type: object, required: [role], properties: {role: {type: string, enum: [engineer, reviewer, release_manager, auditor, sysadmin]}, enabled: {type: boolean}}}
+
+
