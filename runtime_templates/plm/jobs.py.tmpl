@@ -262,7 +262,16 @@ def process_import_job(job_id, commit=False):
         for index, row in enumerate(rows):
             total += 1
             try:
-                parsed.append(validator(row, index))
+                normalized = validator(row, index)
+                # Preview must expose downstream PLM matching errors before a
+                # user can commit an external BOM.  Commit repeats the check
+                # inside one transaction for race safety.
+                if job.kind == 'bom':
+                    if not PartRevision.objects.filter(part__part_code=normalized['root'], revision=normalized['root_revision']).exists():
+                        raise ValueError(f"root part/revision not found in PLM: {normalized['root']} / {normalized['root_revision']}")
+                    if not PartRevision.objects.filter(part__part_code=normalized['child'], revision=normalized['child_revision']).exists():
+                        raise ValueError(f"child part/revision not found in PLM: {normalized['child']} / {normalized['child_revision']}")
+                parsed.append(normalized)
             except Exception as exc:
                 errors.append({"row": index + 2, "message": str(exc), "data": row})
         if errors or not commit:

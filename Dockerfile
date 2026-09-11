@@ -36,12 +36,14 @@ RUN cp /app/runtime_templates/manage.py.tmpl /app/manage.py \
  && cp /app/runtime_templates/plm/__init__.py.tmpl /app/plm/__init__.py \
  && cp /app/runtime_templates/plm/models.py.tmpl /app/plm/models.py \
  && cp /app/runtime_templates/plm/views.py.tmpl /app/plm/views.py \
+ && cp /app/runtime_templates/plm/tests.py.tmpl /app/plm/tests.py \
  && cp /app/runtime_templates/plm/jobs.py.tmpl /app/plm/jobs.py \
  && cp /app/runtime_templates/plm/auth.py.tmpl /app/plm/auth.py \
  && cp /app/runtime_templates/plm/auth_views.py.tmpl /app/plm/auth_views.py \
  && cp /app/runtime_templates/plm/roles.py.tmpl /app/plm/roles.py \
  && cp /app/runtime_templates/plm/serializers.py.tmpl /app/plm/serializers.py \
  && cp /app/runtime_templates/plm/urls.py.tmpl /app/plm/urls.py \
+ && cp /app/runtime_templates/plm/migrations/0003_partattachment_auditevent_parameters.py.tmpl /app/plm/migrations/0003_partattachment_auditevent_parameters.py \
  && cp /app/runtime_templates/entrypoint.sh.tmpl /app/entrypoint.sh
 
 RUN find /app -type f -name '*.sh' -exec sed -i 's/\r$//' {} + \

@@ -26,6 +26,9 @@ class RolePermission(BasePermission):
         if request.method in ('GET','HEAD','OPTIONS'):
             allowed = getattr(view, 'read_roles', None)
             return not allowed or role == 'admin' or role in allowed
+        action_roles = getattr(view, 'action_roles', {}).get(getattr(view, 'action', ''), None)
+        if action_roles is not None:
+            return role == 'admin' or role in action_roles
         # Destructive operations can be stricter than create/update.  This is
         # used by the admin catalog screens to keep accidental deletes out of
         # engineer workflows.
