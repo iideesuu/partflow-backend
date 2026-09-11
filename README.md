@@ -2,7 +2,7 @@
 
 Backend is a Docker-only Django REST control plane. The container chain is HTTP: browser → frontend Nginx → DRF. Production TLS is terminated by the outer deployment Nginx. File bodies never pass through Django or land on the Linux application filesystem; the browser uploads multipart parts directly to MinIO using short-lived presigned URLs.
 
-The default external MinIO S3 endpoint is `http://10.1.58.6:9000`; `:9001` is the Console and is never used for presigned uploads. Four private lab buckets are used: `plm-quarantine-lab`, `plm-draft-lab`, `plm-release-lab`, and `plm-export-lab`. Run `docker compose --profile storage-init run --rm minio-init` once to create them.
+MinIO endpoints, credentials and bucket names are deployment configuration supplied through environment variables. The S3 API and Console endpoints are separate; the Console endpoint is never used for presigned uploads.
 
 ## Start the stack
 

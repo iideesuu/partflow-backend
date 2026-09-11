@@ -41,8 +41,8 @@ def _safe_cell(value):
 def s3_client():
     return boto3.client(
         "s3", endpoint_url=settings.MINIO_ENDPOINT,
-        aws_access_key_id=os.getenv("MINIO_ROOT_USER", "minio_admin"),
-        aws_secret_access_key=os.getenv("MINIO_ROOT_PASSWORD", "minio@2026"),
+        aws_access_key_id=os.getenv("MINIO_ROOT_USER", ""),
+        aws_secret_access_key=os.getenv("MINIO_ROOT_PASSWORD", ""),
         region_name="us-east-1",
     )
 

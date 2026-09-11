@@ -46,7 +46,7 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
 
 def _s3(endpoint):
     import boto3
-    return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=os.getenv('MINIO_ROOT_USER','minio_admin'), aws_secret_access_key=os.getenv('MINIO_ROOT_PASSWORD','minio@2026'), region_name=os.getenv('MINIO_S3_REGION','us-east-1'), config=boto3.session.Config(signature_version='s3v4', s3={'addressing_style':'path'}))
+    return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=os.getenv('MINIO_ROOT_USER',''), aws_secret_access_key=os.getenv('MINIO_ROOT_PASSWORD',''), region_name=os.getenv('MINIO_S3_REGION','us-east-1'), config=boto3.session.Config(signature_version='s3v4', s3={'addressing_style':'path'}))
 def s3_control(): return _s3(settings.MINIO_ENDPOINT)
 def s3_presign(): return _s3(settings.MINIO_PUBLIC_ENDPOINT)
 def s3_client(): return s3_control()
