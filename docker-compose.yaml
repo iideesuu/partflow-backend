@@ -57,7 +57,6 @@ services:
       LDAP_PASS: ${LDAP_PASS:-}
       LDAP_BASE: ${LDAP_BASE:-}
       # External MinIO; all local buckets carry the -lab suffix.
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-}
       MINIO_S3_CONTROL_ENDPOINT: ${MINIO_S3_CONTROL_ENDPOINT:-}
       MINIO_S3_PUBLIC_ENDPOINT: ${MINIO_S3_PUBLIC_ENDPOINT:-}
       MINIO_CONSOLE_URL: ${MINIO_CONSOLE_URL:-}
@@ -105,11 +104,10 @@ services:
     restart: unless-stopped
 
   # Run once when provisioning the local lab buckets.  It talks to the
-  # separately deployed MinIO at MINIO_ENDPOINT and never stores objects locally.
+  # separately deployed MinIO at MINIO_S3_CONTROL_ENDPOINT and never stores objects locally.
   minio-init:
     image: minio/mc:latest
     environment:
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-}
       MINIO_S3_CONTROL_ENDPOINT: ${MINIO_S3_CONTROL_ENDPOINT:-}
       MINIO_S3_PUBLIC_ENDPOINT: ${MINIO_S3_PUBLIC_ENDPOINT:-}
       MINIO_CONSOLE_URL: ${MINIO_CONSOLE_URL:-}
@@ -121,7 +119,7 @@ services:
       MINIO_BUCKET_EXPORT: ${MINIO_BUCKET_EXPORT:-plm-export}
     entrypoint: ["/bin/sh", "-c"]
     command: >-
-      "mc alias set lab \"$${MINIO_ENDPOINT}\" \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
+      "mc alias set lab \"$${MINIO_S3_CONTROL_ENDPOINT}\" \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
       for bucket in \"$${MINIO_BUCKET_QUARANTINE}\" \"$${MINIO_BUCKET_DRAFT}\" \"$${MINIO_BUCKET_RELEASE}\" \"$${MINIO_BUCKET_EXPORT}\"; do
         case \"$$bucket\" in *-lab) ;; *) echo \"refusing non-lab bucket: $$bucket\" >&2; exit 2;; esac;
         mc mb --ignore-existing \"lab/$$bucket\";

@@ -1,4 +1,4 @@
-﻿import os, uuid, hashlib
+import os, uuid, hashlib
 from datetime import timedelta
 from django.conf import settings
 from django.db import connection, transaction
