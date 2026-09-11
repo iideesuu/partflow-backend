@@ -15,8 +15,10 @@ def _payload(user):
 def csrf(request): return JsonResponse({'detail':'ok'})
 
 @ensure_csrf_cookie
-@require_http_methods(['POST'])
+@require_http_methods(['GET','POST'])
 def login_view(request):
+    if request.method == 'GET':
+        return JsonResponse({'detail':'login endpoint','method':'POST','fields':['username','password'],'csrf':'GET /api/v1/auth/csrf/ first'})
     try: data=json.loads(request.body or '{}')
     except ValueError: return JsonResponse({'detail':'invalid JSON'},status=400)
     if ldap_enabled():

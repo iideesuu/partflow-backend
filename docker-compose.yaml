@@ -37,7 +37,10 @@ services:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-only-change-me}
       DJANGO_DEBUG: ${DJANGO_DEBUG:-1}
       DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],web}
-      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      # The browser uses the frontend origin while nginx proxies requests to
+      # this container. Both local hostnames must be trusted for Django's
+      # Origin/CSRF check on the login POST.
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000,http://localhost:5173,http://127.0.0.1:5173}
       POSTGRES_DB: ${POSTGRES_DB:-partflow}
       POSTGRES_USER: ${POSTGRES_USER:-partflow}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-partflow-local-password}
