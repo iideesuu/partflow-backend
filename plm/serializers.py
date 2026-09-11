@@ -14,41 +14,116 @@ class UnitSerializer(serializers.ModelSerializer):
     class Meta: model = Unit; fields = '__all__'
 class PartRevisionSerializer(serializers.ModelSerializer):
     unit_code = serializers.CharField(source='unit.code', read_only=True)
+    part_code = serializers.CharField(source='part.part_code', read_only=True)
+    attachment_count = serializers.IntegerField(source='attachments.count', read_only=True)
+    def validate_parameters(self, value):
+        if not isinstance(value, dict): raise serializers.ValidationError('parameters must be a key/value object')
+        return value
     class Meta:
         model = PartRevision
-        fields = ['id','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','description','revision_state','row_version','created_at']
-        read_only_fields = ['id','created_at']
+        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','created_at']
+        read_only_fields = ['id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
+        extra_kwargs = {'name': {'required': False}, 'revision': {'required': False}}
 class PartSerializer(serializers.ModelSerializer):
-    initial_revision = PartRevisionSerializer(write_only=True, required=True)
+    initial_revision = PartRevisionSerializer(write_only=True, required=False)
     revisions = PartRevisionSerializer(many=True, read_only=True)
     category_code = serializers.CharField(source='category.code', read_only=True)
     category_id = serializers.PrimaryKeyRelatedField(source='category', queryset=Category.objects.all(), write_only=True, required=True)
     class Meta:
         model = Part
-        fields = ['id','part_code','part_number','category_id','category_code','status','tenant_id','row_version','created_at','updated_at','revisions','initial_revision']
-        read_only_fields = ['id','part_number','created_at','updated_at','revisions']
+        fields = ['id','part_code','part_number','number_request','category_id','category_code','status','tenant_id','row_version','created_at','updated_at','revisions','initial_revision']
+        read_only_fields = ['id','part_number','created_at','updated_at','revisions','status','row_version']
     def validate_part_code(self, value):
         import re
         if not re.fullmatch(r'\d{4}-\d{5}', value) or value.endswith('-00000'): raise serializers.ValidationError('invalid part number')
         return value
     def create(self, validated_data):
-        rev = validated_data.pop('initial_revision')
+        rev = validated_data.pop('initial_revision', None)
+        if not rev: raise serializers.ValidationError({'initial_revision':'required when creating a part'})
+        if not str(rev.get('name') or '').strip(): raise serializers.ValidationError({'initial_revision':{'name':'name is required'}})
         from django.db import transaction
         with transaction.atomic():
+            category = Category.objects.select_for_update().get(pk=validated_data['category'].pk)
+            if not category.is_enabled or not category.is_leaf or not category.is_selectable or category.minor_code == '00':
+                raise serializers.ValidationError({'category_id':'choose an enabled selectable minor category'})
+            if validated_data['part_code'][:4] != category.code:
+                raise serializers.ValidationError({'part_code':'number prefix must match selected category'})
+            reservation = NumberRequest.objects.filter(returned_part_code=validated_data['part_code'],status='reserved').first()
+            request = validated_data.get('number_request')
+            if reservation and reservation != request:
+                raise serializers.ValidationError({'number_request':'this number is reserved; supply its number request id'})
+            if request and (request.status != 'reserved' or request.returned_part_code != validated_data['part_code']):
+                raise serializers.ValidationError({'number_request':'number request does not match this part code'})
             part = Part.objects.create(**validated_data)
             PartRevision.objects.create(part=part, **rev)
+            if request:
+                request.status='used'; request.save(update_fields=['status'])
             return part
 class BOMItemSerializer(serializers.ModelSerializer):
-    class Meta: model = BOMItem; fields = '__all__'; read_only_fields = ['id']
+    child_part_code = serializers.CharField(source='child_part_revision.part.part_code', read_only=True)
+    child_revision = serializers.CharField(source='child_part_revision.revision', read_only=True)
+    child_name = serializers.CharField(source='child_part_revision.name', read_only=True)
+    unit_code = serializers.CharField(source='unit.code', read_only=True)
+    class Meta:
+        model = BOMItem
+        fields = ['id','bom_revision','line_no','child_part_revision','child_part_code','child_revision','child_name','quantity','unit','unit_code','position']
+        read_only_fields = ['id','child_part_code','child_revision','child_name','unit_code']
+    def validate(self, attrs):
+        # EBOM rows are immutable once their revision leaves draft and may
+        # only reference released child revisions.  Keeping this check in the
+        # serializer protects both the REST endpoint and import workers.
+        br = attrs.get('bom_revision') or getattr(self.instance, 'bom_revision', None)
+        child = attrs.get('child_part_revision') or getattr(self.instance, 'child_part_revision', None)
+        if br is not None and br.revision_state != 'draft':
+            raise serializers.ValidationError({'bom_revision': 'BOM revision is immutable outside draft state'})
+        if child is not None and child.revision_state != 'released':
+            raise serializers.ValidationError({'child_part_revision': 'referenced revision must be released'})
+        quantity = attrs.get('quantity', getattr(self.instance, 'quantity', None))
+        if quantity is None or quantity <= 0:
+            raise serializers.ValidationError({'quantity': 'must be greater than zero'})
+        position = attrs.get('position', getattr(self.instance, 'position', '__NO_POSITION__'))
+        if br is not None and position and position != '__NO_POSITION__':
+            qs = BOMItem.objects.filter(bom_revision=br, position=position)
+            if self.instance is not None:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'position': 'position must be unique within a BOM revision'})
+        return attrs
 class BOMRevisionSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True, read_only=True)
-    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','revision_state','items']
+    root_part_code = serializers.CharField(source='root_part_revision.part.part_code', read_only=True)
+    root_part_revision_code = serializers.CharField(source='root_part_revision.revision', read_only=True)
+    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher']
 class BOMSerializer(serializers.ModelSerializer):
     revisions = BOMRevisionSerializer(many=True, read_only=True)
     class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','created_at','revisions']; read_only_fields = ['id','created_at','revisions']
+    def validate_bom_type(self, value):
+        if str(value).upper() != 'EBOM':
+            raise serializers.ValidationError('BOM_TYPE_NOT_SUPPORTED: only EBOM is supported')
+        return 'EBOM'
 class UploadSessionSerializer(serializers.ModelSerializer):
     class Meta: model = UploadSession; fields = '__all__'; read_only_fields = ['id','object_key','bucket','state','upload_id','created_at']
 class ImportJobSerializer(serializers.ModelSerializer):
     class Meta: model = ImportJob; fields = '__all__'; read_only_fields = ['id','status','summary','error_report_key','created_at']
 class ExportJobSerializer(serializers.ModelSerializer):
     class Meta: model = ExportJob; fields = '__all__'; read_only_fields = ['id','status','object_key','created_at']
+
+class PartAttachmentSerializer(serializers.ModelSerializer):
+    object_key = serializers.CharField(source='upload_session.object_key', read_only=True)
+    bucket = serializers.CharField(source='upload_session.bucket', read_only=True)
+    class Meta:
+        model = PartAttachment
+        fields = ['id','revision','upload_session','attachment_type','filename','description','object_key','bucket','created_at']
+        read_only_fields = ['id','object_key','bucket','created_at','filename']
+
+class AuditEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AuditEvent
+        fields = '__all__'
+        read_only_fields = ['id','actor','created_at']
+
+class NumberRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NumberRequest
+        fields = '__all__'
+        read_only_fields = ['id','source','source_request_id','returned_part_code','status']

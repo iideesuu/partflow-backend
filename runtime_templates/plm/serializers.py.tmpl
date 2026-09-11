@@ -21,8 +21,8 @@ class PartRevisionSerializer(serializers.ModelSerializer):
         return value
     class Meta:
         model = PartRevision
-        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','attachment_count','created_at']
-        read_only_fields = ['id','created_at','revision_seq','row_version','revision_state']
+        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','created_at']
+        read_only_fields = ['id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
         extra_kwargs = {'name': {'required': False}, 'revision': {'required': False}}
 class PartSerializer(serializers.ModelSerializer):
     initial_revision = PartRevisionSerializer(write_only=True, required=False)
@@ -68,14 +68,39 @@ class BOMItemSerializer(serializers.ModelSerializer):
         model = BOMItem
         fields = ['id','bom_revision','line_no','child_part_revision','child_part_code','child_revision','child_name','quantity','unit','unit_code','position']
         read_only_fields = ['id','child_part_code','child_revision','child_name','unit_code']
+    def validate(self, attrs):
+        # EBOM rows are immutable once their revision leaves draft and may
+        # only reference released child revisions.  Keeping this check in the
+        # serializer protects both the REST endpoint and import workers.
+        br = attrs.get('bom_revision') or getattr(self.instance, 'bom_revision', None)
+        child = attrs.get('child_part_revision') or getattr(self.instance, 'child_part_revision', None)
+        if br is not None and br.revision_state != 'draft':
+            raise serializers.ValidationError({'bom_revision': 'BOM revision is immutable outside draft state'})
+        if child is not None and child.revision_state != 'released':
+            raise serializers.ValidationError({'child_part_revision': 'referenced revision must be released'})
+        quantity = attrs.get('quantity', getattr(self.instance, 'quantity', None))
+        if quantity is None or quantity <= 0:
+            raise serializers.ValidationError({'quantity': 'must be greater than zero'})
+        position = attrs.get('position', getattr(self.instance, 'position', '__NO_POSITION__'))
+        if br is not None and position and position != '__NO_POSITION__':
+            qs = BOMItem.objects.filter(bom_revision=br, position=position)
+            if self.instance is not None:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'position': 'position must be unique within a BOM revision'})
+        return attrs
 class BOMRevisionSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True, read_only=True)
     root_part_code = serializers.CharField(source='root_part_revision.part.part_code', read_only=True)
     root_part_revision_code = serializers.CharField(source='root_part_revision.revision', read_only=True)
-    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','items']
+    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher']
 class BOMSerializer(serializers.ModelSerializer):
     revisions = BOMRevisionSerializer(many=True, read_only=True)
     class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','created_at','revisions']; read_only_fields = ['id','created_at','revisions']
+    def validate_bom_type(self, value):
+        if str(value).upper() != 'EBOM':
+            raise serializers.ValidationError('BOM_TYPE_NOT_SUPPORTED: only EBOM is supported')
+        return 'EBOM'
 class UploadSessionSerializer(serializers.ModelSerializer):
     class Meta: model = UploadSession; fields = '__all__'; read_only_fields = ['id','object_key','bucket','state','upload_id','created_at']
 class ImportJobSerializer(serializers.ModelSerializer):

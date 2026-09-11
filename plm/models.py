@@ -62,6 +62,7 @@ class Part(models.Model):
     def part_number(self): return self.part_code
 
 class PartRevision(models.Model):
+    REVISION_STATES = [('draft','Draft'),('pending_review','Pending review'),('rejected','Rejected'),('approved','Approved'),('release_pending','Release pending'),('released','Released'),('release_failed','Release failed'),('obsolete','Obsolete')]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     part = models.ForeignKey(Part, related_name='revisions', on_delete=models.PROTECT)
     revision = models.CharField(max_length=8, default='A')
@@ -76,8 +77,14 @@ class PartRevision(models.Model):
     manufacturer_part_number = models.CharField(max_length=128, blank=True)
     is_customized = models.BooleanField(default=False)
     rohs_standard = models.CharField(max_length=128, blank=True)
+    # Category controlled technical parameters (key/value JSON).  Keeping the
+    # values on the revision makes every engineering change auditable.
+    parameters = models.JSONField(default=dict, blank=True)
     description = models.TextField(blank=True)
-    revision_state = models.CharField(max_length=20, default='draft')
+    revision_state = models.CharField(max_length=20, choices=REVISION_STATES, default='draft')
+    submitter = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='submitted_part_revisions')
+    reviewer = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='reviewed_part_revisions')
+    publisher = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='published_part_revisions')
     row_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     class Meta:
@@ -92,11 +99,16 @@ class BOM(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 class BOMRevision(models.Model):
+    REVISION_STATES = PartRevision.REVISION_STATES
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     bom = models.ForeignKey(BOM, related_name='revisions', on_delete=models.PROTECT)
     revision = models.CharField(max_length=8, default='A')
     root_part_revision = models.ForeignKey(PartRevision, on_delete=models.PROTECT)
-    revision_state = models.CharField(max_length=20, default='draft')
+    revision_state = models.CharField(max_length=20, choices=REVISION_STATES, default='draft')
+    submitter = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='submitted_bom_revisions')
+    reviewer = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='reviewed_bom_revisions')
+    publisher = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='published_bom_revisions')
+    row_version = models.PositiveIntegerField(default=1)
 
 class BOMItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -122,6 +134,27 @@ class UploadSession(models.Model):
     upload_id = models.CharField(max_length=255, blank=True)
     expires_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+class PartAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    revision = models.ForeignKey(PartRevision, related_name='attachments', on_delete=models.PROTECT)
+    upload_session = models.ForeignKey(UploadSession, related_name='part_attachments', on_delete=models.PROTECT)
+    attachment_type = models.CharField(max_length=32, default='drawing')
+    filename = models.CharField(max_length=255)
+    description = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class AuditEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actor = models.CharField(max_length=150, blank=True)
+    action = models.CharField(max_length=80)
+    resource_type = models.CharField(max_length=80, blank=True)
+    resource_id = models.CharField(max_length=80, blank=True)
+    success = models.BooleanField(default=True)
+    details = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    class Meta:
+        ordering = ['-created_at']
 
 class ImportJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

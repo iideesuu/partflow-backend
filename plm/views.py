@@ -1,22 +1,55 @@
-﻿import os, uuid, hashlib
+import os, uuid, hashlib
 from datetime import timedelta
 from django.conf import settings
 from django.db import connection, transaction
+from django.db.models.deletion import ProtectedError
+from django.db.models import Q, Max
+from django.shortcuts import get_object_or_404
 from django.http import JsonResponse
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError, PermissionDenied, APIException
 from django.contrib.auth import authenticate, login
 from django.contrib.auth.models import User, Group
 from .models import *
 from .serializers import *
+from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url
+from .roles import RolePermission, user_role
+
+def record_audit(request, action, obj=None, **details):
+    return AuditEvent.objects.create(actor=request.user.username, action=action,
+        resource_type=obj.__class__.__name__ if obj is not None else '',
+        resource_id=str(obj.pk) if obj is not None else '', details=details)
+
+class Conflict(APIException):
+    status_code = 409
+    default_detail = 'The object has changed; reload before saving.'
+
+class AuditWriteMixin:
+    @transaction.atomic
+    def perform_create(self, serializer):
+        obj = serializer.save(); record_audit(self.request, 'create', obj)
+    @transaction.atomic
+    def perform_update(self, serializer):
+        obj = serializer.save(); record_audit(self.request, 'update', obj, fields=list(self.request.data))
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        record_audit(self.request, 'delete', instance); instance.delete()
+
+class RoleProtectedMixin:
+    def get_permissions(self):
+        return [RolePermission()]
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
 
-def s3_client():
+def _s3(endpoint):
     import boto3
-    return boto3.client('s3', endpoint_url=settings.MINIO_ENDPOINT, aws_access_key_id=os.getenv('MINIO_ROOT_USER','minio_admin'), aws_secret_access_key=os.getenv('MINIO_ROOT_PASSWORD','minio@2026'), region_name='us-east-1')
+    return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=os.getenv('MINIO_ROOT_USER','minio_admin'), aws_secret_access_key=os.getenv('MINIO_ROOT_PASSWORD','minio@2026'), region_name=os.getenv('MINIO_S3_REGION','us-east-1'), config=boto3.session.Config(signature_version='s3v4', s3={'addressing_style':'path'}))
+def s3_control(): return _s3(settings.MINIO_ENDPOINT)
+def s3_presign(): return _s3(settings.MINIO_PUBLIC_ENDPOINT)
+def s3_client(): return s3_control()
 
 def health_live(request): return JsonResponse({'status':'ok'})
 def health_ready(request):
@@ -25,43 +58,284 @@ def health_ready(request):
         return JsonResponse({'status':'ok'})
     except Exception as exc: return JsonResponse({'status':'error','detail':str(exc)}, status=503)
 
-class CategoryViewSet(viewsets.ModelViewSet):
+class CategoryViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
+    write_roles = ('admin',)
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
     queryset = Category.objects.all(); serializer_class = CategorySerializer
     @action(detail=False, methods=['post'], url_path='import')
     def import_rows(self, request):
-        rows = request.data.get('rows') or []
-        created = 0
-        for row in rows:
-            code = str(row.get('code') or row.get('major_code','') + row.get('minor_code',''))
-            if len(code) == 2: major, minor = code, '00'
-            else: major, minor = code[:2], code[2:4]
-            Category.objects.update_or_create(major_code=major, minor_code=minor, defaults={'name':row.get('name',''),'major_name':row.get('parent_name','') or row.get('name',''),'parent_code':row.get('parent_code',''),'parent_name':row.get('parent_name',''),'path':row.get('full_path',''),'description':row.get('description',''),'aliases':row.get('aliases',''),'standard_references':row.get('standard_references',''),'is_selectable':str(row.get('is_selectable','true')).lower() not in ('false','0'),'attribute_group':row.get('attribute_groups',''),'part_nature':row.get('part_nature',''),'catalog_version':row.get('catalog_version',''),'is_leaf':len(code)>2}); created += 1
-        return Response({'created':created,'total':len(rows)})
+        # File bodies go directly to MinIO; this control-plane API only links
+        # a completed upload to a preview/commit job.
+        session = get_object_or_404(UploadSession, pk=request.data.get('upload_session'))
+        if session.state not in ('uploaded','verified'): raise ValidationError('complete the MinIO upload first')
+        job = ImportJob.objects.create(kind='category', upload_session=session)
+        run_import_job.delay(str(job.id), commit=False)
+        record_audit(request, 'import.queued', job)
+        return Response(ImportJobSerializer(job).data, status=201)
+    @action(detail=False, methods=['post'], url_path='export')
+    def export_rows(self, request):
+        ser=ExportJobSerializer(data={'kind':'category','format':request.data.get('format','csv'),'filters':request.data.get('filters',{})})
+        ser.is_valid(raise_exception=True); job=ser.save(); run_export_job.delay(str(job.id))
+        record_audit(request, 'export.queued', job)
+        return Response(ExportJobSerializer(job).data, status=201)
     def get_queryset(self):
         qs = super().get_queryset()
         if self.request.query_params.get('major_code'): qs = qs.filter(major_code=self.request.query_params['major_code'])
+        if self.request.query_params.get('q'):
+            q=self.request.query_params['q']; qs=qs.filter(Q(name__icontains=q)|Q(major_name__icontains=q)|Q(aliases__icontains=q)|Q(description__icontains=q))
         return qs
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response({'detail':'category is used by parts and cannot be deleted; disable it instead'}, status=status.HTTP_409_CONFLICT)
 
-class UnitViewSet(viewsets.ModelViewSet): queryset = Unit.objects.all(); serializer_class = UnitSerializer
-class PartViewSet(viewsets.ModelViewSet):
+class UnitViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
+    write_roles = ('admin',)
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response({'detail':'unit is in use and cannot be deleted'}, status=status.HTTP_409_CONFLICT)
+    queryset = Unit.objects.all(); serializer_class = UnitSerializer
+class PartViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
+    write_roles = ('engineer','admin')
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
     queryset = Part.objects.select_related('category').prefetch_related('revisions'); serializer_class = PartSerializer
+    def get_queryset(self):
+        qs = super().get_queryset(); p=self.request.query_params
+        for param, field in [('major_code','category__major_code'),('minor_code','category__minor_code'),('category_id','category_id'),('status','status'),('lifecycle','revisions__business_lifecycle'),('kind','revisions__kind'),('revision_state','revisions__revision_state')]:
+            if p.get(param): qs=qs.filter(**{field:p[param]})
+        for field in ('manufacturer','manufacturer_part_number','standard_code','material','rohs_standard'):
+            if p.get(field): qs=qs.filter(**{f'revisions__{field}__icontains':p[field]})
+        if p.get('is_customized') in ('true','false'): qs=qs.filter(revisions__is_customized=(p['is_customized']=='true'))
+        if p.get('q'):
+            q=p['q']; search=Q(part_code__icontains=q)
+            for field in ['name','standard_code','material','manufacturer','manufacturer_part_number','description','parameters']:
+                search |= Q(**{f'revisions__{field}__icontains':q})
+            qs=qs.filter(search)
+        return qs.distinct()
+    @action(detail=True, methods=['get'], url_path='latest-revision')
+    def latest_revision(self, request, pk=None):
+        part = self.get_object(); rev = part.revisions.order_by('-revision_seq').first()
+        if not rev: return Response({'detail':'no revision'}, status=404)
+        return Response(PartRevisionSerializer(rev).data)
+    @action(detail=True, methods=['get'], url_path='where-used')
+    def where_used(self, request, pk=None):
+        part = self.get_object()
+        rows = BOMItem.objects.filter(child_part_revision__part=part).select_related('bom_revision__bom','bom_revision','child_part_revision','unit').order_by('bom_revision__bom__bom_code','line_no')
+        data=[]
+        for row in rows:
+            data.append({'id':str(row.id),'bom_id':str(row.bom_revision.bom_id),'bom_code':row.bom_revision.bom.bom_code,'bom_name':row.bom_revision.bom.name,'bom_revision_id':str(row.bom_revision_id),'bom_revision':row.bom_revision.revision,'line_no':row.line_no,'quantity':str(row.quantity),'position':row.position,'child_revision':row.child_part_revision.revision})
+        return Response(data)
+    @action(detail=True, methods=['get'], url_path='timeline')
+    def timeline(self, request, pk=None):
+        part=self.get_object()
+        events=AuditEvent.objects.filter(resource_type__in=['Part','PartRevision'], resource_id__in=[str(part.id), *[str(x.id) for x in part.revisions.all()]]).order_by('-created_at')[:200]
+        return Response(AuditEventSerializer(events,many=True).data)
+    @transaction.atomic
     def perform_update(self, serializer):
         expected = self.request.headers.get('If-Match')
-        if expected and str(serializer.instance.row_version) != expected: from rest_framework.exceptions import APIException; raise APIException('row_version conflict')
-        serializer.save(row_version=serializer.instance.row_version+1)
-class BOMViewSet(viewsets.ModelViewSet): queryset = BOM.objects.prefetch_related('revisions__items'); serializer_class = BOMSerializer
+        current=Part.objects.select_for_update().get(pk=serializer.instance.pk)
+        if expected and str(current.row_version) != expected.strip('"'): raise Conflict()
+        if 'part_code' in serializer.validated_data and serializer.validated_data['part_code'] != current.part_code: raise ValidationError('part number is immutable')
+        if 'category' in serializer.validated_data and serializer.validated_data['category'] != current.category: raise ValidationError('number category is immutable')
+        obj=serializer.save(row_version=current.row_version+1); record_audit(self.request,'update',obj,fields=list(self.request.data))
+    def destroy(self, request, *args, **kwargs):
+        """Admin delete keeps released history safe by retiring the Part.
 
-class UploadSessionViewSet(viewsets.ViewSet):
+        A Part always has at least one protected PartRevision, so a raw
+        ``DELETE`` would raise a database 500.  Expose the admin delete
+        action as an idempotent retirement (obsolete) while allowing truly
+        empty draft records to be removed physically.
+        """
+        instance = self.get_object()
+        if instance.revisions.exists():
+            instance.status = 'obsolete'
+            instance.row_version += 1
+            instance.save(update_fields=['status','row_version','updated_at'])
+            record_audit(request, 'retire', instance)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response({'detail':'part is referenced and cannot be deleted'}, status=status.HTTP_409_CONFLICT)
+class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
+    write_roles = ('engineer','admin')
+    delete_roles = ('admin',)
+    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    queryset = BOM.objects.prefetch_related('revisions__items'); serializer_class = BOMSerializer
+    def perform_create(self, serializer):
+        if str(serializer.validated_data.get('bom_type', 'EBOM')).upper() != 'EBOM':
+            raise ValidationError({'bom_type': 'BOM_TYPE_NOT_SUPPORTED'})
+        serializer.save(bom_type='EBOM')
+    @action(detail=True, methods=['get'], url_path='where-used')
+    def where_used(self, request, pk=None):
+        bom=self.get_object(); return Response({'bom_id':str(bom.id),'bom_code':bom.bom_code,'revisions':BOMRevisionSerializer(bom.revisions.all(),many=True).data})
+    @action(detail=True, methods=['get','post'], url_path='revisions')
+    def create_revision(self, request, pk=None):
+        bom=self.get_object()
+        if str(bom.bom_type).upper() != 'EBOM':
+            return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM revisions are supported'}, status=422)
+        if request.method == 'GET':
+            return Response(BOMRevisionSerializer(bom.revisions.select_related('root_part_revision__part').prefetch_related('items__child_part_revision__part','items__unit'), many=True).data)
+        latest=bom.revisions.order_by('-revision').first()
+        root_id=request.data.get('root_part_revision') or (str(latest.root_part_revision_id) if latest else None)
+        if not root_id: raise ValidationError({'root_part_revision':'required'})
+        root=get_object_or_404(PartRevision,pk=root_id)
+        rev=request.data.get('revision') or chr(65 + bom.revisions.count())
+        obj=BOMRevision.objects.create(bom=bom,revision=rev,root_part_revision=root,revision_state='draft')
+        record_audit(request,'bom.revision.create',obj)
+        return Response(BOMRevisionSerializer(obj).data,status=201)
+    @action(detail=True, methods=['get','post'], url_path=r'revisions/(?P<revision_id>[^/.]+)/items')
+    def revision_items(self, request, pk=None, revision_id=None):
+        bom=self.get_object(); br=get_object_or_404(BOMRevision,pk=revision_id,bom=bom)
+        if request.method == 'GET':
+            qs=br.items.select_related('child_part_revision__part','unit').order_by('line_no')
+            return Response(BOMItemSerializer(qs,many=True).data)
+        payload=request.data.copy(); payload['bom_revision']=str(br.id)
+        ser=BOMItemSerializer(data=payload); ser.is_valid(raise_exception=True)
+        obj=ser.save(); record_audit(request,'bom.item.create',obj)
+        return Response(BOMItemSerializer(obj).data,status=201)
+
+class NumberRequestViewSet(RoleProtectedMixin, viewsets.ViewSet):
+    read_roles=('viewer','engineer','reviewer','publisher','admin'); write_roles=('engineer','admin')
+    def list(self, request):
+        return Response({'rule':'NNNN-NNNNN','sources':list(NumberSource.objects.filter(is_enabled=True).values('id','name','url')), 'requests':NumberRequestSerializer(NumberRequest.objects.order_by('-id')[:100],many=True).data})
+    def create(self, request):
+        # Number allocation was removed in V1.6.  External systems own the
+        # sequence; PLM only accepts manually registered evidence.
+        return Response({'code':'NUMBER_ALLOCATOR_REMOVED','detail':'PLM does not allocate part numbers'}, status=410)
+        return Response({'code':'NUMBER_ALLOCATOR_REMOVED','detail':'PLM does not allocate part numbers'}, status=410)
+
+class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles=('engineer','admin'); read_roles=('viewer','engineer','reviewer','publisher','admin')
+    action_roles={'transition':('engineer','reviewer','publisher','admin'),'actions':('engineer','reviewer','publisher','admin')}
+    http_method_names=['get','post','put','patch','head','options']
+    serializer_class=PartRevisionSerializer
+    def get_queryset(self): return PartRevision.objects.filter(part_id=self.kwargs['part_pk']).prefetch_related('attachments')
+    @transaction.atomic
+    def perform_create(self, serializer):
+        part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
+        latest=part.revisions.order_by('-revision_seq').first(); data=serializer.validated_data.copy()
+        if latest:
+            for f in ('name','kind','business_lifecycle','unit','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description'):
+                data.setdefault(f,getattr(latest,f))
+        if not str(data.get('name') or '').strip(): raise ValidationError({'name':'name is required'})
+        seq=(latest.revision_seq+1 if latest else 1)
+        # Excel-style letters keep the automatic sequence valid after Z.
+        n=seq; automatic=''
+        while n:
+            n,remainder=divmod(n-1,26); automatic=chr(65+remainder)+automatic
+        rev=data.pop('revision',None) or automatic
+        if PartRevision.objects.filter(part=part,revision=rev).exists(): raise ValidationError('revision already exists')
+        obj=serializer.save(part=part,revision=rev,revision_seq=seq,submitter=self.request.user,**data)
+        record_audit(self.request,'revision.create',obj)
+    @transaction.atomic
+    def perform_update(self, serializer):
+        get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
+        current=PartRevision.objects.select_for_update().get(pk=serializer.instance.pk)
+        expected=self.request.headers.get('If-Match')
+        if expected and str(current.row_version)!=expected.strip('"'): raise Conflict()
+        if current.revision_state!='draft': raise ValidationError('only draft revision can be edited')
+        if 'revision' in serializer.validated_data and serializer.validated_data['revision']!=current.revision: raise ValidationError({'revision':'revision code is immutable; create a new revision'})
+        serializer.instance=current
+        obj=serializer.save(row_version=current.row_version+1); record_audit(self.request,'revision.update',obj)
+    @action(detail=True, methods=['post'], url_path='transition')
+    @transaction.atomic
+    def transition(self, request, pk=None, **kwargs):
+        part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
+        obj=get_object_or_404(PartRevision.objects.select_for_update(),pk=pk,part=part)
+        action=str(request.data.get('action') or '').lower()
+        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'draft','retire':'obsolete','withdraw':'draft','revise':'draft'}
+        target=action_map.get(action, str(request.data.get('state') or request.data.get('revision_state') or '').lower())
+        role=user_role(request.user)
+        role_targets={'engineer':{'pending_review','draft'},'reviewer':{'approved','rejected'},'publisher':{'release_pending','released','release_failed','obsolete'}}
+        if role!='admin' and target not in role_targets.get(role,set()): raise PermissionDenied('this transition is not permitted for your role')
+        expected=request.headers.get('If-Match')
+        if expected and str(obj.row_version)!=expected.strip('"'): raise Conflict()
+        allowed={'draft':{'pending_review'},'pending_review':{'approved','rejected'},'rejected':{'draft'},'approved':{'release_pending','released'},'release_pending':{'released','release_failed'},'release_failed':{'release_pending'},'released':{'obsolete'},'obsolete':set()}
+        if target not in allowed.get(obj.revision_state, set()):
+            return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
+        if target == 'rejected' and not str(request.data.get('reason') or request.data.get('comment') or '').strip():
+            return Response({'code':'REJECT_REASON_REQUIRED','detail':'reason is required'}, status=422)
+        if target == 'released' and obj.attachments.filter(upload_session__state='uploaded').exists():
+            return Response({'code':'ATTACHMENT_SCAN_REQUIRED','detail':'all attachments must be verified before release'}, status=409)
+        if target == 'approved' and role == 'reviewer' and obj.part.revisions.filter(pk=obj.pk,).exists() and getattr(obj, 'submitter_id', None) == request.user.id:
+            return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own revision'}, status=409)
+        if target == 'approved': obj.reviewer = request.user
+        if target in ('release_pending','released','obsolete'): obj.publisher = request.user
+        obj.revision_state=target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','reviewer','publisher'])
+        # Keep the stable Part status useful for list filters while the
+        # revision remains the authoritative technical state.
+        if part.revisions.filter(revision_state='released').exists(): part.status='released'
+        else: part.status=part.revisions.order_by('-revision_seq').values_list('revision_state',flat=True).first() or 'draft'
+        part.row_version += 1; part.save(update_fields=['status','row_version','updated_at'])
+        record_audit(request,'revision.transition',obj,state=target,reason=request.data.get('reason',''))
+        return Response(PartRevisionSerializer(obj).data)
+
+    @action(detail=True, methods=['post'], url_path='actions')
+    def actions(self, request, pk=None, **kwargs):
+        """V1.6 canonical action endpoint; ``transition`` remains an alias."""
+        return self.transition(request, pk=pk, **kwargs)
+
+class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles=('engineer','admin'); read_roles=('viewer','engineer','reviewer','publisher','admin'); serializer_class=PartAttachmentSerializer
+    def get_queryset(self): return PartAttachment.objects.filter(revision__part_id=self.kwargs['part_pk']).select_related('upload_session')
+    def lock_draft_revision(self, revision):
+        part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
+        revision=get_object_or_404(PartRevision.objects.select_for_update(),pk=revision.pk,part=part)
+        if revision.revision_state!='draft': raise ValidationError('only draft revision attachments can be modified')
+        return revision
+    @transaction.atomic
+    def perform_create(self, serializer):
+        session=serializer.validated_data['upload_session']; rev=serializer.validated_data['revision']
+        if str(rev.part_id)!=str(self.kwargs['part_pk']): raise ValidationError('revision does not belong to part')
+        self.lock_draft_revision(rev)
+        if session.state not in ('uploaded','verified'): raise ValidationError('upload must be completed')
+        obj=serializer.save(filename=serializer.validated_data.get('filename') or session.filename); record_audit(self.request,'attachment.create',obj)
+    @transaction.atomic
+    def perform_update(self, serializer):
+        self.lock_draft_revision(serializer.instance.revision)
+        rev=serializer.validated_data.get('revision',serializer.instance.revision)
+        if str(rev.part_id)!=str(self.kwargs['part_pk']): raise ValidationError('revision does not belong to part')
+        self.lock_draft_revision(rev)
+        session=serializer.validated_data.get('upload_session',serializer.instance.upload_session)
+        if session.state not in ('uploaded','verified'): raise ValidationError('upload must be completed')
+        obj=serializer.save(filename=session.filename); record_audit(self.request,'attachment.update',obj)
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        self.lock_draft_revision(instance.revision)
+        record_audit(self.request,'attachment.delete',instance); instance.delete()
+    @action(detail=True,methods=['get'])
+    def download(self, request, pk=None, **kwargs):
+        obj=self.get_object(); url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
+
+class AuditEventViewSet(RoleProtectedMixin, viewsets.ReadOnlyModelViewSet):
+    read_roles=('admin','reviewer','publisher'); queryset=AuditEvent.objects.all(); serializer_class=AuditEventSerializer
+    def get_queryset(self):
+        qs=super().get_queryset(); p=self.request.query_params
+        for key in ('action','resource_type','actor','resource_id'):
+            if p.get(key): qs=qs.filter(**{f'{key}__icontains':p[key]})
+        if p.get('success') in ('true','false'): qs=qs.filter(success=p['success']=='true')
+        return qs[:int(p.get('limit',100))]
+
+class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
+    write_roles = ('engineer','admin')
     def create(self, request):
         data = request.data; size = int(data.get('size') or 0)
         if size <= 0 or size > MAX_UPLOAD_BYTES: return Response({'detail':'size must be between 1 byte and 5GiB','max_bytes':MAX_UPLOAD_BYTES}, status=400)
         filename = os.path.basename(str(data.get('filename') or 'upload.bin'))[:255]
         chunks = max(1, int(data.get('total_chunks') or ((size + 64*1024*1024-1)//(64*1024*1024))))
-        if chunks > 10000: return Response({'detail':'鍒嗙墖鏁伴噺瓒呴檺'}, status=400)
+        if chunks > 10000: return Response({'detail':'part count exceeds 10000','error_code':'PART_COUNT_EXCEEDED'}, status=400)
         bucket = settings.MINIO_BUCKET_QUARANTINE; key = f"uploads/{timezone.now():%Y/%m/%d}/{uuid.uuid4()}-{filename}"
         try:
-            client = s3_client(); mpu = client.create_multipart_upload(Bucket=bucket, Key=key, ContentType=data.get('content_type') or 'application/octet-stream')
-            upload_id = mpu['UploadId']; urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=3600) for i in range(1,chunks+1)]
+            control = s3_control(); mpu = control.create_multipart_upload(Bucket=bucket, Key=key, ContentType=data.get('content_type') or 'application/octet-stream')
+            upload_id = mpu['UploadId']; client = s3_presign(); urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=int(os.getenv('PRESIGN_TTL','900'))) for i in range(1,chunks+1)]
         except Exception as exc: return Response({'detail':f'MinIO unavailable: {exc}'}, status=503)
         obj = UploadSession.objects.create(object_key=key,bucket=bucket,filename=filename,content_type=data.get('content_type') or '',size=size,total_chunks=chunks,declared_sha256=data.get('sha256') or '',upload_id=upload_id,expires_at=timezone.now()+timedelta(hours=2))
         return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,'part_urls':urls,'expires_at':obj.expires_at}, status=201)
@@ -69,27 +343,121 @@ class UploadSessionViewSet(viewsets.ViewSet):
         try: obj=UploadSession.objects.get(pk=pk)
         except UploadSession.DoesNotExist: return Response({'detail':'not found'},status=404)
         return Response(UploadSessionSerializer(obj).data)
+    @action(detail=True, methods=['post'], url_path='parts/presign')
+    def presign_parts(self, request, pk=None):
+        obj=get_object_or_404(UploadSession, pk=pk)
+        if obj.state in ('uploaded','verified'): return Response({'parts':[]})
+        numbers=request.data.get('part_numbers') or []
+        if len(numbers)>20: return Response({'detail':'at most 20 parts per request'},status=400)
+        try: numbers=[int(n) for n in numbers]
+        except (TypeError,ValueError): return Response({'detail':'part_numbers must be integers'},status=400)
+        if any(n<1 or n>obj.total_chunks for n in numbers): return Response({'detail':'part number out of range'},status=400)
+        client=s3_presign(); ttl=int(os.getenv('PRESIGN_TTL','900'))
+        parts=[{'part_number':n,'url':client.generate_presigned_url('upload_part',Params={'Bucket':obj.bucket,'Key':obj.object_key,'UploadId':obj.upload_id,'PartNumber':n},ExpiresIn=ttl),'expires_in':ttl} for n in numbers]
+        return Response({'parts':parts})
     @action(detail=True, methods=['post'], url_path='complete')
     def complete(self, request, pk=None):
         try: obj=UploadSession.objects.get(pk=pk)
         except UploadSession.DoesNotExist: return Response({'detail':'not found'},status=404)
+        # Complete is idempotent: retries after a successful S3 commit return
+        # the same session rather than issuing CompleteMultipartUpload again.
+        if obj.state in ('uploaded', 'verified'):
+            return Response(UploadSessionSerializer(obj).data)
+        if obj.expires_at <= timezone.now():
+            obj.state = 'expired'; obj.save(update_fields=['state'])
+            return Response({'code':'UPLOAD_SESSION_EXPIRED','detail':'upload session expired'}, status=409)
         parts = request.data.get('parts') or []
         if not parts or len(parts) != obj.total_chunks: return Response({'detail':'invalid multipart parts'},status=400)
         try:
-            s3_client().complete_multipart_upload(Bucket=obj.bucket,Key=obj.object_key,UploadId=obj.upload_id,MultipartUpload={'Parts':[{'ETag':p['etag'],'PartNumber':int(p['part_number'])} for p in parts]})
+            normalized = sorted((int(p['part_number']), str(p['etag'])) for p in parts)
+            expected = list(range(1, obj.total_chunks + 1))
+            if [n for n, _ in normalized] != expected:
+                return Response({'code':'UPLOAD_PART_MISSING','missing_parts':[n for n in expected if n not in {x for x,_ in normalized}]}, status=409)
+        except (KeyError, TypeError, ValueError):
+            return Response({'detail':'parts must contain part_number and etag'}, status=400)
+        try:
+            s3_client().complete_multipart_upload(Bucket=obj.bucket,Key=obj.object_key,UploadId=obj.upload_id,MultipartUpload={'Parts':[{'ETag':etag,'PartNumber':num} for num, etag in normalized]})
+            head = s3_client().head_object(Bucket=obj.bucket, Key=obj.object_key)
+            if int(head.get('ContentLength', -1)) != int(obj.size):
+                obj.state='failed'; obj.save(update_fields=['state'])
+                return Response({'code':'UPLOAD_SIZE_MISMATCH','expected':obj.size,'actual':head.get('ContentLength')}, status=422)
             obj.state='uploaded'; obj.save(update_fields=['state'])
         except Exception as exc: return Response({'detail':str(exc)},status=400)
         return Response(UploadSessionSerializer(obj).data)
 
-class ImportJobViewSet(viewsets.ModelViewSet): queryset=ImportJob.objects.all().order_by('-created_at'); serializer_class=ImportJobSerializer
-    
-class ExportJobViewSet(viewsets.ModelViewSet): queryset=ExportJob.objects.all().order_by('-created_at'); serializer_class=ExportJobSerializer
+class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('engineer','admin')
+    queryset=ImportJob.objects.all().order_by('-created_at'); serializer_class=ImportJobSerializer
+    def create(self, request):
+        payload=request.data.copy(); payload['upload_session']=payload.get('upload_session') or payload.get('upload_session_id'); payload['kind']=payload.get('kind') or 'part'
+        ser=self.get_serializer(data=payload); ser.is_valid(raise_exception=True); job=ser.save()
+        try: run_import_job.delay(str(job.id), commit=False)
+        except Exception: pass
+        return Response(self.get_serializer(job).data, status=201)
+    @action(detail=True, methods=['post'])
+    def actions(self, request, pk=None):
+        job=self.get_object(); name=request.data.get('action')
+        if name=='commit':
+            try: run_import_job.delay(str(job.id), commit=True)
+            except Exception: run_import_job(str(job.id), commit=True)
+        elif name=='cancel': cancel_import_job(job.id)
+        else: return Response({'detail':'action must be commit or cancel'}, status=400)
+        job.refresh_from_db(); return Response(self.get_serializer(job).data)
+
+class ExportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
+    write_roles = ('viewer','engineer','reviewer','publisher','admin')
+    queryset=ExportJob.objects.all().order_by('-created_at'); serializer_class=ExportJobSerializer
+    def create(self, request):
+        ser=self.get_serializer(data=request.data); ser.is_valid(raise_exception=True); job=ser.save()
+        try: run_export_job.delay(str(job.id))
+        except Exception: pass
+        return Response(self.get_serializer(job).data, status=201)
+    @action(detail=True, methods=['get'])
+    def download(self, request, pk=None):
+        job=self.get_object(); url=export_download_url(job)
+        if not url: return Response({'detail':'export not ready'}, status=409)
+        return Response({'url':url, 'expires_in':3600})
+    @action(detail=True, methods=['post'])
+    def actions(self, request, pk=None):
+        if request.data.get('action')=='cancel': cancel_export_job(self.get_object().id); return Response(self.get_serializer(self.get_object()).data)
+        return Response({'detail':'action must be cancel'}, status=400)
 
 @api_view(['GET'])
 def storage_health(request):
     try:
-        c=s3_client(); c.head_bucket(Bucket=settings.MINIO_BUCKET_QUARANTINE); return Response({'status':'ok','endpoint':settings.MINIO_ENDPOINT,'buckets':[settings.MINIO_BUCKET_QUARANTINE,settings.MINIO_BUCKET_DRAFT,settings.MINIO_BUCKET_RELEASE]})
+        c=s3_client(); buckets=[settings.MINIO_BUCKET_QUARANTINE,settings.MINIO_BUCKET_DRAFT,settings.MINIO_BUCKET_RELEASE,settings.MINIO_BUCKET_EXPORT]; [c.head_bucket(Bucket=b) for b in buckets]; return Response({'status':'ok','endpoint':settings.MINIO_ENDPOINT,'buckets':buckets})
     except Exception as exc: return Response({'status':'error','detail':str(exc)},status=503)
+
+@api_view(['POST'])
+@transaction.atomic
+def bom_revision_actions(request, pk=None):
+    """Canonical BOMRevision action endpoint (EBOM lifecycle subset)."""
+    obj = get_object_or_404(BOMRevision.objects.select_for_update(), pk=pk)
+    if str(obj.bom.bom_type).upper() != 'EBOM':
+        return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM is supported'}, status=422)
+    action = str(request.data.get('action') or '').lower()
+    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'draft','retire':'obsolete','withdraw':'draft','revise':'draft'}
+    target = action_map.get(action, str(request.data.get('state') or '').lower())
+    role = user_role(request.user)
+    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'release_pending','released','release_failed','obsolete'}}
+    if role != 'admin' and target not in role_targets.get(role, set()):
+        return Response({'detail':'this transition is not permitted for your role'}, status=403)
+    expected = request.headers.get('If-Match')
+    if expected and str(obj.row_version) != expected.strip('"'):
+        return Response({'code':'CONCURRENT_MODIFICATION','current_row_version':obj.row_version}, status=409)
+    allowed = {'draft': {'pending_review'}, 'pending_review': {'approved','rejected'}, 'rejected': {'draft'}, 'approved': {'release_pending'}, 'release_pending': {'released','release_failed'}, 'release_failed': {'release_pending'}, 'released': {'obsolete'}, 'obsolete': set()}
+    if target not in allowed.get(obj.revision_state, set()):
+        return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
+    if target == 'rejected' and not str(request.data.get('reason') or '').strip():
+        return Response({'code':'REJECT_REASON_REQUIRED','detail':'reason is required'}, status=422)
+    if target == 'released' and obj.items.filter(child_part_revision__revision_state__in=['draft','pending_review','approved','release_failed','obsolete']).exists():
+        return Response({'code':'REFERENCED_REVISION_NOT_RELEASED','detail':'all BOM child revisions must be released'}, status=409)
+    if target == 'approved': obj.reviewer = request.user
+    if target in ('release_pending','released','obsolete'): obj.publisher = request.user
+    if target == 'pending_review': obj.submitter = request.user
+    obj.revision_state = target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','reviewer','publisher','submitter'])
+    record_audit(request, 'bom.revision.transition', obj, state=target, reason=request.data.get('reason',''))
+    return Response(BOMRevisionSerializer(obj).data)
 
 
 @api_view(['POST'])
@@ -105,5 +473,6 @@ def ldap_login(request):
     elif user.groups.filter(name='engineer').exists(): role = 'engineer'
     elif user.groups.filter(name='reviewer').exists(): role = 'reviewer'
     return Response({'user':username,'role':role})
+
 
 

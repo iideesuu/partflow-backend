@@ -44,7 +44,13 @@ RUN cp /app/runtime_templates/manage.py.tmpl /app/manage.py \
  && cp /app/runtime_templates/plm/serializers.py.tmpl /app/plm/serializers.py \
  && cp /app/runtime_templates/plm/urls.py.tmpl /app/plm/urls.py \
  && cp /app/runtime_templates/plm/migrations/0003_partattachment_auditevent_parameters.py.tmpl /app/plm/migrations/0003_partattachment_auditevent_parameters.py \
+ && for f in /app/runtime_templates/plm/migrations/*.py.tmpl; do n=$(basename "$f" .tmpl); cp "$f" "/app/plm/migrations/$n"; done \
  && cp /app/runtime_templates/entrypoint.sh.tmpl /app/entrypoint.sh
+
+# Materialize any newly added container-safe template automatically (including
+# future migrations), so the runtime cannot silently miss a .tmpl module.
+RUN find /app/runtime_templates -type f -name '*.tmpl' \
+ | while IFS= read -r src; do rel="${src#/app/runtime_templates/}"; dst="/app/${rel%.tmpl}"; mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"; done
 
 RUN find /app -type f -name '*.sh' -exec sed -i 's/\r$//' {} + \
     && chmod +x /app/entrypoint.sh 2>/dev/null || true \
