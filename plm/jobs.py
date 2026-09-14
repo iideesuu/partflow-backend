@@ -51,7 +51,11 @@ def _clamd_scan(body, timeout=1800):
 def scan_attachment(attachment_id):
     """Fail-closed ClamAV gate.
 
-    Transparent enterprise encryption is intentionally treated as opaque: the\n    container only receives ciphertext, so a ClamAV ``OK`` verdict over those\n    bytes would be meaningless. Opaque content remains available to authorized\n    users for download, BOM binding and release; explicit malware and scanner\n    errors continue to quarantine or block the attachment.
+    Transparent enterprise encryption is intentionally treated as opaque: the
+    container only receives ciphertext, so a ClamAV ``OK`` verdict over those
+    bytes would be meaningless. Opaque content remains available to authorized
+    users for download, BOM binding and release; explicit malware and scanner
+    errors continue to quarantine or block the attachment.
     """
     attachment = PartAttachment.objects.select_related('upload_session').get(pk=attachment_id)
     session = attachment.upload_session
@@ -85,7 +89,6 @@ def scan_attachment(attachment_id):
                 return data
         verdict = _clamd_scan(Tee())
         scan.sha256 = digest.hexdigest(); scan.result = verdict
-        normalized_verdict = verdict.rstrip('\x00\r\n ').upper()
         normalized_verdict = verdict.rstrip('\x00\r\n ').upper()
         scan.status = 'clean' if clean else 'infected'; scan.engine_version = os.getenv('CLAMAV_ENGINE_VERSION','unknown'); scan.signature_version = os.getenv('CLAMAV_DB_VERSION','unknown'); scan.finished_at=timezone.now(); scan.save(update_fields=['sha256','result','status','engine_version','signature_version','finished_at'])
         attachment.security_state = 'available' if clean else 'quarantined'; attachment.scanner_engine_version=scan.engine_version; attachment.scanner_signature_version=scan.signature_version; attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scanner_engine_version','scanner_signature_version','scanned_at'])
