@@ -719,7 +719,7 @@ def bom_revision_actions(request, pk=None):
         for revision in revisions:
             gate_error = _release_gate(revision)
             if gate_error:
-                gate_error['detail'] = 'all BOM attachments must have a current clean ClamAV scan'
+                gate_error['detail'] = 'all BOM attachments must have a clean scan or approved opaque-encryption disposition'
                 return Response(gate_error, status=409)
     if target == 'approved': obj.reviewer = request.user
     if target in ('release_pending','released','obsolete'): obj.publisher = request.user
