@@ -198,7 +198,7 @@ class PartViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
 class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
     write_roles = ('engineer','admin')
     delete_roles = ('admin',)
-    read_roles = ('viewer','engineer','reviewer','publisher','admin')
+    read_roles = ('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
     queryset = BOM.objects.prefetch_related('revisions__items'); serializer_class = BOMSerializer
     def perform_create(self, serializer):
         if str(serializer.validated_data.get('bom_type', 'EBOM')).upper() != 'EBOM':

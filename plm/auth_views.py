@@ -2,6 +2,7 @@
 from django.core.cache import cache
 from django.contrib.auth import authenticate as django_authenticate, login, logout, get_user_model
 from django.contrib.auth.models import User
+from django.contrib.auth.models import Group
 from datetime import timedelta
 from django.http import JsonResponse
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -9,7 +10,9 @@ from django.views.decorators.http import require_http_methods
 from .auth import authenticate as ldap_authenticate, shadow_user, ldap_enabled
 from .roles import user_role, assign_role, ROLES
 from .models import UserSecurity
+from .models import AuditEvent
 from django.utils import timezone
+from django.db import transaction
 
 def _rate_key(username, request):
     remote = request.META.get('REMOTE_ADDR', 'unknown')
@@ -47,13 +50,21 @@ def login_view(request):
     key, failures = _rate_status(username, request)
     if failures >= 5:
         return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
-    local_user = get_user_model().objects.filter(username=username).first()
+    # Shadow users have unusable passwords. Existing password-bearing Django
+    # accounts (including admin) keep their local identity when LDAP is on.
+    # Resolve casing once so neither failed nor disabled local accounts can
+    # fall through to a same-named directory identity.
+    candidates = list(get_user_model().objects.filter(username__iexact=username)[:2])
+    if len(candidates) > 1:
+        return JsonResponse({'code':'AUTH_INVALID','detail':'invalid credentials'}, status=401)
+    local_user = candidates[0] if candidates else None
+    use_local = bool(local_user and (local_user.has_usable_password() or local_user.is_superuser))
     local_security = UserSecurity.objects.filter(user=local_user).first() if local_user else None
     if local_security and local_security.locked_until and local_security.locked_until > timezone.now():
         retry = max(1, int((local_security.locked_until - timezone.now()).total_seconds()))
         return JsonResponse({'code':'RATE_LIMITED','detail':'account temporarily locked','retry_after':retry}, status=429, headers={'Retry-After':str(retry)})
-    if ldap_enabled():
-        try: user=shadow_user(ldap_authenticate(data.get('username',''),data.get('password','')))
+    if not use_local and ldap_enabled():
+        try: user=shadow_user(ldap_authenticate(username,data.get('password','')))
         except Exception:
             failures = _auth_failure(username, request)
             if local_security:
@@ -63,7 +74,7 @@ def login_view(request):
             if failures >= 5: return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
             return JsonResponse({'code':'AUTH_INVALID','detail':'LDAP authentication failed'},status=401)
     else:
-        user=django_authenticate(request,username=username,password=data.get('password',''))
+        user=django_authenticate(request,username=local_user.username if local_user else username,password=data.get('password',''))
         if not user:
             failures = _auth_failure(username, request)
             if local_security:
@@ -95,20 +106,34 @@ def me(request):
 def logout_view(request): logout(request); return JsonResponse({'detail':'logged out'})
 
 @require_http_methods(['GET','POST'])
+@transaction.atomic
 def users(request):
     if not request.user.is_authenticated or user_role(request.user) not in ('admin','sysadmin'): return JsonResponse({'code':'ROLE_REQUIRED','detail':'sysadmin role required'},status=403)
     User=get_user_model()
     if request.method=='GET': return JsonResponse({'roles':ROLES,'users':[{'username':u.username,'active':u.is_active,'role':user_role(u)} for u in User.objects.order_by('username')]})
     try:
         data=json.loads(request.body or '{}')
-        target=assign_role(request.user,data['username'],data['role'])
-        security, _ = UserSecurity.objects.get_or_create(user=target)
         action = str(data.get('action') or 'assign_role')
+        target=User.objects.select_for_update().get(username=data['username'])
+        actor_role = user_role(request.user)
+        if target.is_superuser and actor_role != 'admin': raise PermissionError('superuser is protected')
+        before_role = user_role(target)
+        if action == 'assign_role':
+            target=assign_role(request.user,target.username,data['role'])
+        elif action == 'revoke':
+            target.groups.remove(*target.groups.filter(name__startswith='plm:'))
+        elif action not in ('disable','enable'):
+            raise ValueError('invalid user action')
+        security, _ = UserSecurity.objects.select_for_update().get_or_create(user=target)
         if action == 'disable': target.is_active = False; target.save(update_fields=['is_active'])
         elif action == 'enable': target.is_active = True; target.save(update_fields=['is_active'])
         elif action == 'revoke': security.revoked_at = timezone.now()
-        security.permission_version += 1
-        security.session_nonce = __import__('uuid').uuid4()
-        security.save(update_fields=['permission_version','session_nonce','revoked_at','updated_at'])
+        if action != 'assign_role':
+            security.permission_version += 1
+            security.session_nonce = __import__('uuid').uuid4()
+            security.save(update_fields=['permission_version','session_nonce','revoked_at','updated_at'])
+        AuditEvent.objects.create(actor=request.user.username, action='user.' + action,
+            resource_type='User', resource_id=target.username,
+            details={'previous_role': before_role, 'role': user_role(target), 'active': target.is_active, 'permission_version': security.permission_version})
     except (KeyError,ValueError,PermissionError,User.DoesNotExist) as exc: return JsonResponse({'code':'ROLE_ASSIGNMENT_INVALID','detail':str(exc)},status=400)
     return JsonResponse({'user':_payload(target, request)})

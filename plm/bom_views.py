@@ -39,7 +39,7 @@ def record_change(request, revision, action_name, obj):
 
 class BOMRevisionViewSet(viewsets.ModelViewSet):
     permission_classes = [RolePermission]
-    read_roles = ('engineer', 'reviewer', 'publisher', 'auditor', 'viewer')
+    read_roles = ('engineer', 'reviewer', 'publisher', 'auditor', 'viewer', 'sysadmin', 'admin')
     write_roles = ('engineer',)
     serializer_class = BOMRevisionSerializer
     queryset = BOMRevision.objects.select_related('bom', 'root_part_revision__part').prefetch_related('items')
@@ -76,7 +76,7 @@ class BOMRevisionViewSet(viewsets.ModelViewSet):
 
 class BOMItemViewSet(viewsets.ModelViewSet):
     permission_classes = [RolePermission]
-    read_roles = ('engineer', 'reviewer', 'publisher', 'auditor', 'viewer')
+    read_roles = ('engineer', 'reviewer', 'publisher', 'auditor', 'viewer', 'sysadmin', 'admin')
     write_roles = ('engineer',)
     serializer_class = BOMItemSerializer
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']

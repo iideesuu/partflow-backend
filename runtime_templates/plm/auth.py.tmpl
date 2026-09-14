@@ -64,11 +64,17 @@ def shadow_user(identity):
         # LDAP UIDs are commonly case-insensitive.  Match an existing shadow
         # account case-insensitively before creating one, so a locally disabled
         # account cannot be bypassed by changing username casing.
-        user=User.objects.select_for_update().filter(username__iexact=identity.username[:150]).first()
+        candidates=list(User.objects.select_for_update().filter(username__iexact=identity.username[:150])[:2])
+        if len(candidates)>1: raise ValueError('LDAP user is ambiguous locally')
+        user=candidates[0] if candidates else None
         created=False
         if user is None:
             user,created=User.objects.get_or_create(username=identity.username[:150], defaults={'is_active':True})
         if not created and not user.is_active: raise ValueError('user is disabled locally')
+        # A directory identity must never take over a local password account
+        # or inherit a reserved local superuser identity/permissions.
+        if not created and (user.has_usable_password() or user.is_superuser):
+            raise ValueError('LDAP identity conflicts with a local account')
         changed=[]
         if identity.display_name and user.first_name!=identity.display_name: user.first_name=identity.display_name; changed.append('first_name')
         if identity.email and user.email!=identity.email: user.email=identity.email; changed.append('email')

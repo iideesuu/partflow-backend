@@ -50,13 +50,21 @@ def login_view(request):
     key, failures = _rate_status(username, request)
     if failures >= 5:
         return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
-    local_user = get_user_model().objects.filter(username=username).first()
+    # Shadow users have unusable passwords. Existing password-bearing Django
+    # accounts (including admin) keep their local identity when LDAP is on.
+    # Resolve casing once so neither failed nor disabled local accounts can
+    # fall through to a same-named directory identity.
+    candidates = list(get_user_model().objects.filter(username__iexact=username)[:2])
+    if len(candidates) > 1:
+        return JsonResponse({'code':'AUTH_INVALID','detail':'invalid credentials'}, status=401)
+    local_user = candidates[0] if candidates else None
+    use_local = bool(local_user and (local_user.has_usable_password() or local_user.is_superuser))
     local_security = UserSecurity.objects.filter(user=local_user).first() if local_user else None
     if local_security and local_security.locked_until and local_security.locked_until > timezone.now():
         retry = max(1, int((local_security.locked_until - timezone.now()).total_seconds()))
         return JsonResponse({'code':'RATE_LIMITED','detail':'account temporarily locked','retry_after':retry}, status=429, headers={'Retry-After':str(retry)})
-    if ldap_enabled():
-        try: user=shadow_user(ldap_authenticate(data.get('username',''),data.get('password','')))
+    if not use_local and ldap_enabled():
+        try: user=shadow_user(ldap_authenticate(username,data.get('password','')))
         except Exception:
             failures = _auth_failure(username, request)
             if local_security:
@@ -66,7 +74,7 @@ def login_view(request):
             if failures >= 5: return JsonResponse({'code':'RATE_LIMITED','detail':'too many authentication failures','retry_after':900}, status=429, headers={'Retry-After':'900'})
             return JsonResponse({'code':'AUTH_INVALID','detail':'LDAP authentication failed'},status=401)
     else:
-        user=django_authenticate(request,username=username,password=data.get('password',''))
+        user=django_authenticate(request,username=local_user.username if local_user else username,password=data.get('password',''))
         if not user:
             failures = _auth_failure(username, request)
             if local_security:

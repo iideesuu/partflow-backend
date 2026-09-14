@@ -18,7 +18,17 @@ def ldap_enabled():
 
 def _config():
     # V1.6 names are canonical; legacy aliases remain read-only compatibility.
-    host=os.getenv('LDAP_HOST','').strip(); base=(os.getenv('LDAP_BASE_DN') or os.getenv('LDAP_BASE') or '').strip(); bind_dn=os.getenv('LDAP_BIND_DN','').strip(); password=os.getenv('LDAP_BIND_PASSWORD') or os.getenv('LDAP_PASS',''); uid=(os.getenv('LDAP_UID_ATTRIBUTE') or os.getenv('LDAP_UID') or 'sAMAccountName').strip(); port=int(os.getenv('LDAP_PORT','389')); connect_timeout=float(os.getenv('LDAP_CONNECT_TIMEOUT','5')); search_timeout=float(os.getenv('LDAP_SEARCH_TIMEOUT','10'))
+    host=os.getenv('LDAP_HOST','').strip()
+    base=(os.getenv('LDAP_BASE_DN') or os.getenv('LDAP_BASE') or '').strip()
+    bind_dn=os.getenv('LDAP_BIND_DN','').strip()
+    password=os.getenv('LDAP_BIND_PASSWORD') or os.getenv('LDAP_PASS','')
+    uid=(os.getenv('LDAP_UID_ATTRIBUTE') or os.getenv('LDAP_UID') or 'sAMAccountName').strip()
+    port=int(os.getenv('LDAP_PORT','389'))
+    # ldap3 requires integer timeout values for socket/select operations.
+    # Accept only positive whole seconds so a malformed deployment fails
+    # during configuration validation instead of surfacing as a login 401.
+    connect_timeout=int(os.getenv('LDAP_CONNECT_TIMEOUT','5'))
+    search_timeout=int(os.getenv('LDAP_SEARCH_TIMEOUT','10'))
     if not host or not base or not bind_dn or not password: raise ValueError('LDAP configuration is incomplete')
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9-]*',uid): raise ValueError('invalid LDAP UID attribute')
     if connect_timeout <= 0 or search_timeout <= 0: raise ValueError('invalid LDAP timeout')
@@ -28,8 +38,10 @@ def authenticate(username,password):
     if not ldap_enabled(): raise ValueError('LDAP is disabled')
     username=(username or '').strip()
     if not username or not password: raise ValueError('credentials required')
-    host,port,base,bind_dn,bind_password,uid,connect_timeout,search_timeout=_config(); server=Server(host,port=port,use_ssl=(port==636),connect_timeout=connect_timeout)
-    # read_only rejects mutating LDAP operations; this module only binds/searches.
+    host,port,base,bind_dn,bind_password,uid,connect_timeout,search_timeout=_config()
+    server=Server(host,port=port,use_ssl=(port==636),connect_timeout=connect_timeout)
+    # read_only=True rejects client-side mutating operations; this module only
+    # exposes bind/search/unbind and never calls LDAP write primitives.
     service=Connection(server,user=bind_dn,password=bind_password,read_only=True,receive_timeout=search_timeout,auto_bind=False)
     try:
         if not service.bind(): raise ValueError('LDAP service bind failed')
@@ -49,12 +61,20 @@ def authenticate(username,password):
 def shadow_user(identity):
     User=get_user_model()
     with transaction.atomic():
-        # Resolve local shadow identity case-insensitively, without re-enabling it.
-        user=User.objects.select_for_update().filter(username__iexact=identity.username[:150]).first()
+        # LDAP UIDs are commonly case-insensitive.  Match an existing shadow
+        # account case-insensitively before creating one, so a locally disabled
+        # account cannot be bypassed by changing username casing.
+        candidates=list(User.objects.select_for_update().filter(username__iexact=identity.username[:150])[:2])
+        if len(candidates)>1: raise ValueError('LDAP user is ambiguous locally')
+        user=candidates[0] if candidates else None
         created=False
         if user is None:
             user,created=User.objects.get_or_create(username=identity.username[:150], defaults={'is_active':True})
         if not created and not user.is_active: raise ValueError('user is disabled locally')
+        # A directory identity must never take over a local password account
+        # or inherit a reserved local superuser identity/permissions.
+        if not created and (user.has_usable_password() or user.is_superuser):
+            raise ValueError('LDAP identity conflicts with a local account')
         changed=[]
         if identity.display_name and user.first_name!=identity.display_name: user.first_name=identity.display_name; changed.append('first_name')
         if identity.email and user.email!=identity.email: user.email=identity.email; changed.append('email')
