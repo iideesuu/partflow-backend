@@ -110,12 +110,19 @@ class ExportJobSerializer(serializers.ModelSerializer):
     class Meta: model = ExportJob; fields = '__all__'; read_only_fields = ['id','status','object_key','created_at']
 
 class PartAttachmentSerializer(serializers.ModelSerializer):
+    versions = serializers.SerializerMethodField()
     object_key = serializers.CharField(source='upload_session.object_key', read_only=True)
     bucket = serializers.CharField(source='upload_session.bucket', read_only=True)
     class Meta:
         model = PartAttachment
-        fields = ['id','revision','upload_session','attachment_type','filename','description','encryption_mode','object_key','bucket','security_state','scan_generation','scanner_engine_version','scanner_signature_version','scan_error','scanned_at','created_at']
+        fields = ['id','revision','upload_session','attachment_type','filename','description','encryption_mode','object_key','bucket','security_state','scan_generation','scanner_engine_version','scanner_signature_version','scan_error','scanned_at','created_at','versions']
         read_only_fields = ['id','object_key','bucket','created_at','filename','security_state','scan_generation','scanner_engine_version','scanner_signature_version','scan_error','scanned_at']
+
+    def get_versions(self, obj):
+        return [{'id': str(v.id), 'version_id': v.version_id, 'sha256': v.sha256,
+                 'size_bytes': v.size_bytes, 'security_state': v.security_state,
+                 'rescan_required': v.rescan_required,
+                 'created_at': v.created_at} for v in obj.versions.all()]
 
     def validate(self, attrs):
         # Re-labelling the same ciphertext must not turn it into plaintext.

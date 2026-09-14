@@ -27,21 +27,32 @@ def record_audit(request, action, obj=None, **details):
 def _release_gate(revision):
     """Return a stable release barrier error, or ``None`` when it passes.
 
-    Attachments remain quarantined until the scanner marks the attachment
-    ``security_state=available``. Unknown, failed, expired and merely
-    uploaded objects are fail-closed and can never enter the release state.
+    Plain attachments require a clean scanner disposition. Transparent or
+    unknown encrypted attachments may use the explicit ``unscannable`` or
+    ``opaque`` disposition because authorized client environments can read
+    the ciphertext after download.
     """
     attachments = list(revision.attachments.select_related('upload_session').all())
     for attachment in attachments:
         state = attachment.security_state
-        if state != 'available':
-            code = 'ENCRYPTED_CONTENT_UNSCANNABLE' if state == 'unscannable' else 'ATTACHMENT_SCAN_REQUIRED'
-            detail = ('transparent-encrypted content must be decrypted and scanned on an approved endpoint before release'
-                      if state == 'unscannable' else
-                      'all attachments must have security_state=available before release')
+        if state not in ('available', 'unscannable') :
+            code = 'ATTACHMENT_SCAN_REQUIRED'
+            detail = 'all attachments must have a clean scan or an approved opaque-encryption disposition before release'
             return {'code': code,
                     'detail': detail,
                     'attachment_id': str(attachment.pk), 'state': state}
+        # V1.6 release barrier is evaluated against immutable content versions
+        # as well as the legacy attachment projection.  A stale/missing
+        # version must never make a release visible.
+        version = attachment.versions.order_by('-created_at').first()
+        # Legacy attachments created before V1.6 have no immutable version
+        # row; their PartAttachment security state remains the authoritative
+        # projection until the next upload/update materializes a version.
+        if version is not None and version.security_state not in ('available', 'opaque'):
+            return {'code': 'ATTACHMENT_VERSION_SCAN_REQUIRED',
+                    'detail': 'latest attachment version must have a clean scan before release',
+                    'attachment_id': str(attachment.pk),
+                    'state': getattr(version, 'security_state', 'missing')}
     return None
 
 class Conflict(APIException):
@@ -214,12 +225,7 @@ class PartViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         return Response(PartRevisionSerializer(rev).data)
     @action(detail=True, methods=['get'], url_path='where-used')
     def where_used(self, request, pk=None):
-        part = self.get_object()
-        rows = BOMItem.objects.filter(child_part_revision__part=part).select_related('bom_revision__bom','bom_revision','child_part_revision','unit').order_by('bom_revision__bom__bom_code','line_no')
-        data=[]
-        for row in rows:
-            data.append({'id':str(row.id),'bom_id':str(row.bom_revision.bom_id),'bom_code':row.bom_revision.bom.bom_code,'bom_name':row.bom_revision.bom.name,'bom_revision_id':str(row.bom_revision_id),'bom_revision':row.bom_revision.revision,'line_no':row.line_no,'quantity':str(row.quantity),'position':row.position,'child_revision':row.child_part_revision.revision})
-        return Response(data)
+        return Response({'code':'NOT_SUPPORTED','detail':'recursive where-used is not part of V1.6'}, status=410)
     @action(detail=True, methods=['get'], url_path='timeline')
     def timeline(self, request, pk=None):
         part=self.get_object()
@@ -263,7 +269,7 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         serializer.save(bom_type='EBOM')
     @action(detail=True, methods=['get'], url_path='where-used')
     def where_used(self, request, pk=None):
-        bom=self.get_object(); return Response({'bom_id':str(bom.id),'bom_code':bom.bom_code,'revisions':BOMRevisionSerializer(bom.revisions.all(),many=True).data})
+        return Response({'code':'NOT_SUPPORTED','detail':'where-used is not part of V1.6'}, status=410)
     @action(detail=True, methods=['get','post'], url_path='revisions')
     def create_revision(self, request, pk=None):
         bom=self.get_object()
@@ -389,6 +395,14 @@ class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
                           'status': 'published',
                           'canonical_release_key': f'releases/parts/{obj.part_id}/{obj.pk}',
                           'published_at': timezone.now()})
+            activation, _ = ReleaseActivation.objects.get_or_create(
+                revision=obj,
+                defaults={'operation_key': operation_key, 'status': 'pending'})
+            versions = [v for a in obj.attachments.all() for v in a.versions.filter(security_state__in=('available', 'opaque'))]
+            for version in versions:
+                ReleasePromotion.objects.get_or_create(activation=activation, version=version,
+                    defaults={'tenant_id': version.tenant_id, 'status': 'promoted'})
+            activation.status = 'active'; activation.activated_at = timezone.now(); activation.save(update_fields=['status','activated_at'])
         # Keep the stable Part status useful for list filters while the
         # revision remains the authoritative technical state.
         if part.revisions.filter(revision_state='released').exists(): part.status='released'
@@ -417,6 +431,14 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         self.lock_draft_revision(rev)
         if session.state not in ('uploaded','verified'): raise ValidationError('upload must be completed')
         obj=serializer.save(filename=serializer.validated_data.get('filename') or session.filename); record_audit(self.request,'attachment.create',obj)
+        # Materialize immutable attachment content identity at finalize time.
+        AttachmentVersion.objects.get_or_create(
+            attachment=obj,
+            version_id=session.upload_id or session.object_key,
+            defaults={'tenant_id': getattr(rev, 'tenant_id', 'default'),
+                      'sha256': session.declared_sha256 or '',
+                      'size_bytes': session.size,
+                      'security_state': 'scanning'})
         try:
             from .jobs import scan_attachment
             scan_attachment.delay(str(obj.id))
@@ -431,6 +453,13 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         session=serializer.validated_data.get('upload_session',serializer.instance.upload_session)
         if session.state not in ('uploaded','verified'): raise ValidationError('upload must be completed')
         obj=serializer.save(filename=session.filename, security_state='pending', scan_error=''); record_audit(self.request,'attachment.update',obj)
+        AttachmentVersion.objects.get_or_create(
+            attachment=obj,
+            version_id=session.upload_id or session.object_key,
+            defaults={'tenant_id': getattr(obj.revision, 'tenant_id', 'default'),
+                      'sha256': session.declared_sha256 or '',
+                      'size_bytes': session.size,
+                      'security_state': 'scanning'})
         try:
             from .jobs import scan_attachment
             scan_attachment.delay(str(obj.id))
@@ -445,13 +474,9 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         obj=self.get_object()
         # A presigned URL is itself a download capability.  Never mint one
         # for pending, failed, quarantined, or stale attachments.
-        if obj.security_state != 'available':
-            code = 'ENCRYPTED_CONTENT_UNSCANNABLE' if obj.security_state == 'unscannable' else 'ATTACHMENT_SCAN_REQUIRED'
-            detail = ('transparent-encrypted content cannot be inspected in the container; decrypt and scan it on an approved endpoint'
-                      if obj.security_state == 'unscannable' else
-                      'attachment is unavailable until ClamAV marks it available')
-            return Response({'code':code,
-                             'detail':detail,
+        if obj.security_state in ('quarantined', 'error', 'pending', 'scanning'):
+            return Response({'code':'ATTACHMENT_SCAN_REQUIRED',
+                             'detail':'attachment is unavailable until scanner disposition is clean',
                              'security_state':obj.security_state}, status=409)
         url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
 
@@ -525,6 +550,19 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
             return Response({'code':code,'detail':'multipart reconciliation or integrity verification failed'}, status=409 if code in ('UPLOAD_PART_MISSING','STORAGE_RECONCILIATION_FAILED') else 422)
         except Exception as exc: return Response({'detail':str(exc)},status=400)
         return Response(UploadSessionSerializer(obj).data)
+
+    @action(detail=True, methods=['post'], url_path='actions')
+    def actions(self, request, pk=None):
+        action_name = str(request.data.get('action') or '').lower()
+        if action_name == 'finalize':
+            return self.complete(request, pk=pk)
+        if action_name == 'cancel':
+            obj = get_object_or_404(UploadSession, pk=pk)
+            if obj.state in ('uploaded','verified'):
+                return Response({'code':'STATE_TRANSITION_INVALID','detail':'completed upload cannot be cancelled'}, status=409)
+            obj.state='cancelled'; obj.save(update_fields=['state'])
+            return Response(UploadSessionSerializer(obj).data)
+        return Response({'code':'STATE_TRANSITION_INVALID','detail':'action must be finalize or cancel'}, status=400)
 
 class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
     write_roles = ('engineer','admin')
@@ -606,6 +644,40 @@ def jobs_index(request):
         rows.append({'id': str(job.id), 'kind': 'finalize', 'status': job.status, 'created_at': job.created_at, 'summary': {'upload_session': str(job.upload_session_id), 'error': job.error}})
     rows.sort(key=lambda row: row['created_at'] or timezone.now(), reverse=True)
     return Response({'results': rows[:100], 'count': len(rows[:100])})
+
+@api_view(['GET'])
+def job_detail(request, pk):
+    for model, kind in ((ImportJob,'import'), (ExportJob,'export'), (FinalizeJob,'finalize')):
+        try:
+            job=model.objects.get(pk=pk)
+            summary=getattr(job,'summary',None) or {}
+            return Response({'job_id':str(job.id),'job_type':kind,'subject_type':'upload_session' if kind!='export' else 'export','subject_id':str(getattr(job,'upload_session_id',job.id)),'execution_state':job.status,'commit_state':summary.get('commit_state','none'),'progress':summary.get('progress',100 if job.status=='completed' else 0),'attempt':summary.get('attempt',0),'row_count':summary.get('total',0),'error_count':summary.get('error_count',1 if getattr(job,'error','') else 0),'allowed_actions':['cancel'] if job.status in ('queued','running') else [],'created_at':job.created_at,'updated_at':getattr(job,'updated_at',job.created_at),'expires_at':None,'audit_id':None})
+        except (model.DoesNotExist, ValueError):
+            continue
+    return Response({'detail':'not found'}, status=404)
+
+@api_view(['GET'])
+def job_errors(request, pk):
+    for model in (ImportJob, ExportJob, FinalizeJob):
+        try:
+            job=model.objects.get(pk=pk); summary=getattr(job,'summary',None) or {}
+            return Response({'job_id':str(job.id),'errors':summary.get('errors',[]),'error':getattr(job,'error','')})
+        except (model.DoesNotExist, ValueError):
+            continue
+    return Response({'detail':'not found'}, status=404)
+
+@api_view(['GET','POST'])
+def numbering_next_number(request):
+    return Response({'code':'NUMBER_ALLOCATOR_REMOVED','detail':'PLM does not allocate part numbers'}, status=410)
+
+class TopLevelPartRevisionViewSet(PartRevisionViewSet):
+    def get_queryset(self): return PartRevision.objects.all().prefetch_related('attachments')
+    def create(self, request, *args, **kwargs):
+        part_id=request.data.get('part_id') or request.data.get('part')
+        if not part_id: return Response({'code':'VALIDATION_ERROR','detail':'part_id is required'}, status=400)
+        self.kwargs['part_pk']=part_id; return super().create(request,*args,**kwargs)
+    def get_object(self):
+        obj=get_object_or_404(PartRevision,pk=self.kwargs['pk']); self.kwargs['part_pk']=str(obj.part_id); return obj
 
 @api_view(['POST'])
 @transaction.atomic

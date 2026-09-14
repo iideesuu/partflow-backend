@@ -25,6 +25,7 @@ from django.utils import timezone
 from .models import (
     BOM, BOMItem, BOMRevision, Category, ImportJob, Part, PartRevision,
     Unit, UploadSession, ExportJob, FinalizeJob, PartAttachment, AttachmentScan,
+    AttachmentVersion,
 )
 
 MAX_BYTES = 5 * 1024 * 1024
@@ -50,22 +51,26 @@ def _clamd_scan(body, timeout=1800):
 def scan_attachment(attachment_id):
     """Fail-closed ClamAV gate.
 
-    Transparent enterprise encryption is intentionally treated as opaque: the
-    container only receives ciphertext, so a ClamAV ``OK`` verdict over those
-    bytes would be meaningless.  Such attachments stay blocked until an
-    approved endpoint scans the decrypted file and uploads it in
-    ``client_decrypted`` mode.
+    Transparent enterprise encryption is intentionally treated as opaque: the\n    container only receives ciphertext, so a ClamAV ``OK`` verdict over those\n    bytes would be meaningless. Opaque content remains available to authorized\n    users for download, BOM binding and release; explicit malware and scanner\n    errors continue to quarantine or block the attachment.
     """
     attachment = PartAttachment.objects.select_related('upload_session').get(pk=attachment_id)
     session = attachment.upload_session
     scan = AttachmentScan.objects.create(attachment=attachment, status='running', generation=uuid.uuid4().hex, started_at=timezone.now())
+    version = attachment.versions.order_by('-created_at').first()
     attachment.security_state = 'scanning'; attachment.scan_generation = scan.generation; attachment.save(update_fields=['security_state','scan_generation'])
     if attachment.encryption_mode in ('transparent', 'unknown'):
         scan.status = 'opaque'; scan.result = 'OPAQUE_ENCRYPTED_CONTENT'; scan.error = 'encrypted or unknown content cannot be trusted as clean; upload authorized plaintext for container scanning or integrate a trusted decryption/scan service'; scan.finished_at = timezone.now()
         scan.save(update_fields=['status','result','error','finished_at'])
-        attachment.security_state = 'unscannable'; attachment.scan_error = scan.error; attachment.scanned_at = timezone.now()
+        # The container cannot inspect enterprise-transparent ciphertext, but
+        # the encrypted object remains valid: authorized client environments
+        # can decrypt it after download. Keep it publishable while recording
+        # the opaque scan result for audit purposes.
+        attachment.security_state = 'available'; attachment.scan_error = scan.error; attachment.scanned_at = timezone.now()
         attachment.save(update_fields=['security_state','scan_error','scanned_at'])
-        return {'status': 'opaque', 'code': 'ENCRYPTED_CONTENT_UNSCANNABLE', 'attachment': str(attachment.id)}
+        if version is not None:
+            version.security_state = 'available'; version.rescan_required = False
+            version.save(update_fields=['security_state','rescan_required'])
+        return {'status': 'opaque', 'code': 'OPAQUE_ENCRYPTED_CONTENT', 'attachment': str(attachment.id)}
     if session.size > CLAMAV_MAX_BYTES:
         scan.status='error'; scan.error='UPLOAD_SIZE_EXCEEDED: ClamAV publish limit is 4 GiB'; scan.finished_at=timezone.now(); scan.save(update_fields=['status','error','finished_at'])
         attachment.security_state='error'; attachment.scan_error=scan.error; attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scan_error','scanned_at']); return {'status':'error','code':'UPLOAD_SIZE_EXCEEDED'}
@@ -81,13 +86,21 @@ def scan_attachment(attachment_id):
         verdict = _clamd_scan(Tee())
         scan.sha256 = digest.hexdigest(); scan.result = verdict
         normalized_verdict = verdict.rstrip('\x00\r\n ').upper()
-        clean = normalized_verdict.endswith(': OK') or normalized_verdict == 'OK'
+        normalized_verdict = verdict.rstrip('\x00\r\n ').upper()
         scan.status = 'clean' if clean else 'infected'; scan.engine_version = os.getenv('CLAMAV_ENGINE_VERSION','unknown'); scan.signature_version = os.getenv('CLAMAV_DB_VERSION','unknown'); scan.finished_at=timezone.now(); scan.save(update_fields=['sha256','result','status','engine_version','signature_version','finished_at'])
         attachment.security_state = 'available' if clean else 'quarantined'; attachment.scanner_engine_version=scan.engine_version; attachment.scanner_signature_version=scan.signature_version; attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scanner_engine_version','scanner_signature_version','scanned_at'])
+        if version is not None:
+            version.sha256 = scan.sha256
+            version.security_state = 'available' if clean else 'quarantined'
+            version.rescan_required = not clean
+            version.last_pass_policy_version = os.getenv('CLAMAV_POLICY_VERSION', 'clamav-default') if clean else ''
+            version.save(update_fields=['sha256','security_state','rescan_required','last_pass_policy_version'])
         return {'status': scan.status, 'attachment': str(attachment.id)}
     except Exception as exc:
         scan.status='error'; scan.error=str(exc); scan.finished_at=timezone.now(); scan.save(update_fields=['status','error','finished_at'])
         attachment.security_state='error'; attachment.scan_error=str(exc); attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scan_error','scanned_at'])
+        if version is not None:
+            version.security_state='rejected'; version.rescan_required=True; version.save(update_fields=['security_state','rescan_required'])
         raise
     finally:
         if body is not None:

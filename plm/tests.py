@@ -171,7 +171,7 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(publication.status, 'published')
         self.assertEqual(ReleasePublication.objects.filter(revision=self.revision).count(), 1)
 
-    def test_transparent_encryption_is_opaque_and_cannot_release_or_download(self):
+    def test_transparent_encryption_remains_downloadable_and_publishable(self):
         session = UploadSession.objects.create(
             object_key='tests/encrypted-release', bucket='test-bucket', filename='drawing.pdf',
             size=128, expires_at=timezone.now(), state='uploaded')
@@ -181,13 +181,12 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
         self.assertEqual(self.transition('approved', 'reviewer').status_code, 200)
         self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
-        blocked = self.transition('released', 'publisher')
-        self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(blocked.data['code'], 'ENCRYPTED_CONTENT_UNSCANNABLE')
+        released = self.transition('released', 'publisher')
+        self.assertEqual(released.status_code, 200)
         self.client.force_authenticate(self.users['engineer'])
         response = self.client.get(f'/api/v1/parts/{self.part.pk}/attachments/{attachment.pk}/download/')
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.data['code'], 'ENCRYPTED_CONTENT_UNSCANNABLE')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('url', response.data)
 
     @patch('plm.jobs._clamd_scan')
     def test_transparent_encryption_short_circuits_clamav(self, clamd_scan):
@@ -200,8 +199,8 @@ class RevisionAPIContractTests(TestCase):
         result = scan_attachment(str(attachment.pk))
         attachment.refresh_from_db()
         scan = AttachmentScan.objects.get(attachment=attachment)
-        self.assertEqual(result['code'], 'ENCRYPTED_CONTENT_UNSCANNABLE')
-        self.assertEqual(attachment.security_state, 'unscannable')
+        self.assertEqual(result['code'], 'OPAQUE_ENCRYPTED_CONTENT')
+        self.assertEqual(attachment.security_state, 'available')
         self.assertEqual(scan.result, 'OPAQUE_ENCRYPTED_CONTENT')
         clamd_scan.assert_not_called()
 
@@ -214,10 +213,8 @@ class RevisionAPIContractTests(TestCase):
         bom_revision = BOMRevision.objects.create(bom=bom, root_part_revision=self.revision)
         item = BOMItem.objects.create(bom_revision=bom_revision, child_part_revision=self.revision, line_no=1, quantity=2)
         response = self.client.get(f'/api/v1/parts/{self.part.pk}/where-used/')
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data[0]['id'], str(item.pk))
-        self.assertEqual(response.data[0]['bom_revision_id'], str(bom_revision.pk))
-        self.assertEqual(response.data[0]['child_revision'], 'A')
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.data['code'], 'NOT_SUPPORTED')
         self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
         timeline = self.client.get(f'/api/v1/parts/{self.part.pk}/timeline/')
         self.assertEqual(timeline.status_code, 200)

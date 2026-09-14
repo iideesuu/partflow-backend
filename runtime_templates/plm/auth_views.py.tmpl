@@ -8,7 +8,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 from .auth import authenticate as ldap_authenticate, shadow_user, ldap_enabled
-from .roles import user_role, assign_role, ROLES
+from .roles import user_role, assign_role, ROLES, ROLE_PERMISSIONS
 from .models import UserSecurity
 from .models import AuditEvent
 from django.utils import timezone
@@ -137,3 +137,46 @@ def users(request):
             details={'previous_role': before_role, 'role': user_role(target), 'active': target.is_active, 'permission_version': security.permission_version})
     except (KeyError,ValueError,PermissionError,User.DoesNotExist) as exc: return JsonResponse({'code':'ROLE_ASSIGNMENT_INVALID','detail':str(exc)},status=400)
     return JsonResponse({'user':_payload(target, request)})
+
+@require_http_methods(['GET'])
+def admin_roles(request):
+    if not request.user.is_authenticated or user_role(request.user) not in ('admin','sysadmin'):
+        return JsonResponse({'code':'ROLE_REQUIRED','detail':'sysadmin role required'}, status=403)
+    return JsonResponse({'roles':[{'name': role, 'permissions': sorted(ROLE_PERMISSIONS.get(role, set()))} for role in ROLES]})
+
+@require_http_methods(['GET','PATCH','POST'])
+@transaction.atomic
+def admin_user_detail(request, user_id=None):
+    if not request.user.is_authenticated or user_role(request.user) not in ('admin','sysadmin'):
+        return JsonResponse({'code':'ROLE_REQUIRED','detail':'sysadmin role required'},status=403)
+    User=get_user_model()
+    try: target=User.objects.select_for_update().get(pk=user_id)
+    except User.DoesNotExist: return JsonResponse({'detail':'not found'},status=404)
+    security,_=UserSecurity.objects.get_or_create(user=target)
+    if request.method=='GET':
+        payload=_payload(target,request); payload.update({'user_id':target.pk,'email':target.email,'is_active':target.is_active,'permission_version':security.permission_version,'last_login':target.last_login}); return JsonResponse(payload)
+    try: data=json.loads(request.body or '{}')
+    except ValueError: return JsonResponse({'code':'INVALID_JSON','detail':'invalid JSON'},status=400)
+    if request.method=='PATCH':
+        if set(data)-{'role'}: return JsonResponse({'code':'FIELD_NOT_WRITABLE','detail':'only role may be changed'},status=422)
+        if not request.headers.get('Idempotency-Key'):
+            return JsonResponse({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'},status=428)
+        expected=request.headers.get('If-Match')
+        if not expected:
+            return JsonResponse({'code':'PRECONDITION_REQUIRED','detail':'If-Match header is required'}, status=428)
+        if expected and expected.strip('"')!=str(security.permission_version): return JsonResponse({'code':'CONCURRENT_MODIFICATION','permission_version':security.permission_version},status=409)
+        try:
+            role=data.get('role')
+            if role is None: target.groups.remove(*target.groups.filter(name__startswith='plm:'))
+            else: target=assign_role(request.user,target.username,role)
+        except (ValueError,PermissionError) as exc: return JsonResponse({'code':'ROLE_ASSIGNMENT_INVALID','detail':str(exc)},status=400)
+        security.permission_version+=1; security.session_nonce=__import__('uuid').uuid4(); security.save(update_fields=['permission_version','session_nonce','updated_at'])
+        return JsonResponse({'user':_payload(target,request),'permission_version':security.permission_version})
+    action=str(data.get('action') or '').lower()
+    if not request.headers.get('Idempotency-Key'):
+        return JsonResponse({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'},status=428)
+    if action not in ('disable','restore','revoke-sessions'): return JsonResponse({'code':'STATE_TRANSITION_INVALID','detail':'invalid user action'},status=400)
+    if action=='disable': target.is_active=False; target.save(update_fields=['is_active'])
+    elif action=='restore': target.is_active=True; target.save(update_fields=['is_active'])
+    security.permission_version+=1; security.session_nonce=__import__('uuid').uuid4(); security.save(update_fields=['permission_version','session_nonce','updated_at'])
+    return JsonResponse({'user':_payload(target,request),'permission_version':security.permission_version})
