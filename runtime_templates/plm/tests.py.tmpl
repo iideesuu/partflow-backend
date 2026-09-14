@@ -5,7 +5,8 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import AuditEvent, BOM, BOMItem, BOMRevision, Category, Part, PartRevision, PartAttachment, UploadSession
+from .models import AuditEvent, BOM, BOMItem, BOMRevision, Category, Part, PartRevision, PartAttachment, UploadSession, ReleasePublication, AttachmentScan
+from .jobs import scan_attachment
 
 
 class RevisionAPIContractTests(TestCase):
@@ -122,6 +123,59 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.client.patch(detail, {'description': 'Edited'}, format='json').status_code, 400)
         self.assertEqual(self.client.delete(detail).status_code, 400)
         self.assertEqual(PartAttachment.objects.filter(revision=self.revision).count(), 1)
+
+    def test_release_barrier_requires_clean_scan_and_publication_is_idempotent(self):
+        session = UploadSession.objects.create(
+            object_key='tests/release-gate', bucket='test-bucket', filename='drawing.pdf',
+            size=1, expires_at=timezone.now(), state='uploaded')
+        attachment = PartAttachment.objects.create(revision=self.revision, upload_session=session,
+                                                    filename='drawing.pdf')
+        self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
+        self.assertEqual(self.transition('approved', 'reviewer').status_code, 200)
+        self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
+        blocked = self.transition('released', 'publisher')
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.data['code'], 'ATTACHMENT_SCAN_REQUIRED')
+        attachment.security_state = 'available'; attachment.save(update_fields=['security_state'])
+        released = self.transition('released', 'publisher')
+        self.assertEqual(released.status_code, 200, released.data)
+        publication = ReleasePublication.objects.get(revision=self.revision)
+        self.assertEqual(publication.status, 'published')
+        self.assertEqual(ReleasePublication.objects.filter(revision=self.revision).count(), 1)
+
+    def test_transparent_encryption_is_opaque_and_cannot_release_or_download(self):
+        session = UploadSession.objects.create(
+            object_key='tests/encrypted-release', bucket='test-bucket', filename='drawing.pdf',
+            size=128, expires_at=timezone.now(), state='uploaded')
+        attachment = PartAttachment.objects.create(
+            revision=self.revision, upload_session=session, filename='drawing.pdf',
+            encryption_mode='transparent', security_state='unscannable')
+        self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
+        self.assertEqual(self.transition('approved', 'reviewer').status_code, 200)
+        self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
+        blocked = self.transition('released', 'publisher')
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.data['code'], 'ENCRYPTED_CONTENT_UNSCANNABLE')
+        self.client.force_authenticate(self.users['engineer'])
+        response = self.client.get(f'/api/v1/parts/{self.part.pk}/attachments/{attachment.pk}/download/')
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['code'], 'ENCRYPTED_CONTENT_UNSCANNABLE')
+
+    @patch('plm.jobs._clamd_scan')
+    def test_transparent_encryption_short_circuits_clamav(self, clamd_scan):
+        session = UploadSession.objects.create(
+            object_key='tests/encrypted-scan', bucket='test-bucket', filename='drawing.pdf',
+            size=128, expires_at=timezone.now(), state='uploaded')
+        attachment = PartAttachment.objects.create(
+            revision=self.revision, upload_session=session, filename='drawing.pdf',
+            encryption_mode='transparent')
+        result = scan_attachment(str(attachment.pk))
+        attachment.refresh_from_db()
+        scan = AttachmentScan.objects.get(attachment=attachment)
+        self.assertEqual(result['code'], 'ENCRYPTED_CONTENT_UNSCANNABLE')
+        self.assertEqual(attachment.security_state, 'unscannable')
+        self.assertEqual(scan.result, 'OPAQUE_ENCRYPTED_CONTENT')
+        clamd_scan.assert_not_called()
 
     def test_advanced_filters_and_where_used_contract(self):
         response = self.client.get('/api/v1/parts/', {'revision_state': 'draft', 'material': 'Alum', 'standard_code': 'ISO', 'is_customized': 'true'})

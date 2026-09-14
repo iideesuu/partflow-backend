@@ -1,4 +1,4 @@
-﻿import json, os, hashlib
+import json, os, hashlib
 from django.core.cache import cache
 from django.contrib.auth import authenticate as django_authenticate, login, logout, get_user_model
 from django.contrib.auth.models import User

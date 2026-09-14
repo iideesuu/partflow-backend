@@ -1,4 +1,4 @@
-﻿from rest_framework.routers import DefaultRouter
+from rest_framework.routers import DefaultRouter
 from django.urls import path, include
 from .views import CategoryViewSet, UnitViewSet, PartViewSet, BOMViewSet, UploadSessionViewSet, ImportJobViewSet, ExportJobViewSet, storage_health, admin_health, admin_settings, jobs_index, NumberRequestViewSet, PartRevisionViewSet, PartAttachmentViewSet, AuditEventViewSet, bom_revision_actions
 from .auth_views import csrf, login_view, me, logout_view, users

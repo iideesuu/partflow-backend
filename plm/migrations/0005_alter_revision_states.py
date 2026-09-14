@@ -1,4 +1,4 @@
-﻿from django.db import migrations, models
+from django.db import migrations, models
 class Migration(migrations.Migration):
     dependencies = [('plm', '0004_revision_lifecycle_actors')]
     operations = [

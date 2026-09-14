@@ -24,6 +24,26 @@ def record_audit(request, action, obj=None, **details):
         resource_type=obj.__class__.__name__ if obj is not None else '',
         resource_id=str(obj.pk) if obj is not None else '', details=details)
 
+def _release_gate(revision):
+    """Return a stable release barrier error, or ``None`` when it passes.
+
+    Attachments remain quarantined until the scanner marks the attachment
+    ``security_state=available``. Unknown, failed, expired and merely
+    uploaded objects are fail-closed and can never enter the release state.
+    """
+    attachments = list(revision.attachments.select_related('upload_session').all())
+    for attachment in attachments:
+        state = attachment.security_state
+        if state != 'available':
+            code = 'ENCRYPTED_CONTENT_UNSCANNABLE' if state == 'unscannable' else 'ATTACHMENT_SCAN_REQUIRED'
+            detail = ('transparent-encrypted content must be decrypted and scanned on an approved endpoint before release'
+                      if state == 'unscannable' else
+                      'all attachments must have security_state=available before release')
+            return {'code': code,
+                    'detail': detail,
+                    'attachment_id': str(attachment.pk), 'state': state}
+    return None
+
 class Conflict(APIException):
     status_code = 409
     default_detail = 'The object has changed; reload before saving.'
@@ -44,6 +64,7 @@ class RoleProtectedMixin:
         return [RolePermission()]
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
+CLAMAV_MAX_UPLOAD_BYTES = int(os.getenv('CLAMAV_MAX_BYTES', str(4 * 1024 * 1024 * 1024)))
 
 def _complete_upload_session(obj, parts):
     """Reconcile, complete, and verify one multipart session."""
@@ -289,18 +310,30 @@ class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         if role!='admin' and target not in role_targets.get(role,set()): raise PermissionDenied('this transition is not permitted for your role')
         expected=request.headers.get('If-Match')
         if expected and str(obj.row_version)!=expected.strip('"'): raise Conflict()
-        allowed={'draft':{'pending_review'},'pending_review':{'approved','rejected'},'rejected':{'draft'},'approved':{'release_pending','released'},'release_pending':{'released','release_failed'},'release_failed':{'release_pending'},'released':{'obsolete'},'obsolete':set()}
+        allowed={'draft':{'pending_review'},'pending_review':{'approved','rejected'},'rejected':{'draft'},'approved':{'release_pending'},'release_pending':{'released','release_failed'},'release_failed':{'release_pending'},'released':{'obsolete'},'obsolete':set()}
         if target not in allowed.get(obj.revision_state, set()):
             return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
         if target == 'rejected' and not str(request.data.get('reason') or request.data.get('comment') or '').strip():
             return Response({'code':'REJECT_REASON_REQUIRED','detail':'reason is required'}, status=422)
-        if target == 'released' and obj.attachments.filter(upload_session__state='uploaded').exists():
-            return Response({'code':'ATTACHMENT_SCAN_REQUIRED','detail':'all attachments must be verified before release'}, status=409)
+        if target == 'released':
+            blocked = _release_gate(obj)
+            if blocked:
+                return Response(blocked, status=409)
         if target == 'approved' and role == 'reviewer' and obj.part.revisions.filter(pk=obj.pk,).exists() and getattr(obj, 'submitter_id', None) == request.user.id:
             return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own revision'}, status=409)
         if target == 'approved': obj.reviewer = request.user
         if target in ('release_pending','released','obsolete'): obj.publisher = request.user
         obj.revision_state=target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','reviewer','publisher'])
+        if target == 'released':
+            # Durable, unique publication handle: repeated release retries
+            # return the same publication instead of creating duplicates.
+            operation_key = f'part-revision:{obj.pk}:release'
+            ReleasePublication.objects.get_or_create(
+                revision=obj,
+                defaults={'operation_key': operation_key,
+                          'status': 'published',
+                          'canonical_release_key': f'releases/parts/{obj.part_id}/{obj.pk}',
+                          'published_at': timezone.now()})
         # Keep the stable Part status useful for list filters while the
         # revision remains the authoritative technical state.
         if part.revisions.filter(revision_state='released').exists(): part.status='released'
@@ -329,6 +362,11 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         self.lock_draft_revision(rev)
         if session.state not in ('uploaded','verified'): raise ValidationError('upload must be completed')
         obj=serializer.save(filename=serializer.validated_data.get('filename') or session.filename); record_audit(self.request,'attachment.create',obj)
+        try:
+            from .jobs import scan_attachment
+            scan_attachment.delay(str(obj.id))
+        except Exception:
+            obj.security_state='error'; obj.scan_error='scanner worker unavailable'; obj.save(update_fields=['security_state','scan_error'])
     @transaction.atomic
     def perform_update(self, serializer):
         self.lock_draft_revision(serializer.instance.revision)
@@ -337,14 +375,30 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         self.lock_draft_revision(rev)
         session=serializer.validated_data.get('upload_session',serializer.instance.upload_session)
         if session.state not in ('uploaded','verified'): raise ValidationError('upload must be completed')
-        obj=serializer.save(filename=session.filename); record_audit(self.request,'attachment.update',obj)
+        obj=serializer.save(filename=session.filename, security_state='pending', scan_error=''); record_audit(self.request,'attachment.update',obj)
+        try:
+            from .jobs import scan_attachment
+            scan_attachment.delay(str(obj.id))
+        except Exception:
+            obj.security_state='error'; obj.scan_error='scanner worker unavailable'; obj.save(update_fields=['security_state','scan_error'])
     @transaction.atomic
     def perform_destroy(self, instance):
         self.lock_draft_revision(instance.revision)
         record_audit(self.request,'attachment.delete',instance); instance.delete()
     @action(detail=True,methods=['get'])
     def download(self, request, pk=None, **kwargs):
-        obj=self.get_object(); url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
+        obj=self.get_object()
+        # A presigned URL is itself a download capability.  Never mint one
+        # for pending, failed, quarantined, or stale attachments.
+        if obj.security_state != 'available':
+            code = 'ENCRYPTED_CONTENT_UNSCANNABLE' if obj.security_state == 'unscannable' else 'ATTACHMENT_SCAN_REQUIRED'
+            detail = ('transparent-encrypted content cannot be inspected in the container; decrypt and scan it on an approved endpoint'
+                      if obj.security_state == 'unscannable' else
+                      'attachment is unavailable until ClamAV marks it available')
+            return Response({'code':code,
+                             'detail':detail,
+                             'security_state':obj.security_state}, status=409)
+        url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
 
 class AuditEventViewSet(RoleProtectedMixin, viewsets.ReadOnlyModelViewSet):
     read_roles=('admin','reviewer','publisher','auditor','sysadmin'); queryset=AuditEvent.objects.all(); serializer_class=AuditEventSerializer
@@ -360,6 +414,7 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
     def create(self, request):
         data = request.data; size = int(data.get('size') or 0)
         if size <= 0 or size > MAX_UPLOAD_BYTES: return Response({'detail':'size must be between 1 byte and 5GiB','max_bytes':MAX_UPLOAD_BYTES}, status=400)
+        if size > CLAMAV_MAX_UPLOAD_BYTES: return Response({'code':'UPLOAD_SIZE_EXCEEDED','detail':'attachments over 4 GiB cannot pass ClamAV scanning','max_bytes':CLAMAV_MAX_UPLOAD_BYTES}, status=413)
         filename = os.path.basename(str(data.get('filename') or 'upload.bin'))[:255]
         chunks = max(1, int(data.get('total_chunks') or ((size + 64*1024*1024-1)//(64*1024*1024))))
         if chunks > 10000: return Response({'detail':'part count exceeds 10000','error_code':'PART_COUNT_EXCEEDED'}, status=400)
@@ -521,6 +576,15 @@ def bom_revision_actions(request, pk=None):
         return Response({'code':'REJECT_REASON_REQUIRED','detail':'reason is required'}, status=422)
     if target == 'released' and obj.items.filter(child_part_revision__revision_state__in=['draft','pending_review','approved','release_failed','obsolete']).exists():
         return Response({'code':'REFERENCED_REVISION_NOT_RELEASED','detail':'all BOM child revisions must be released'}, status=409)
+    if target == 'released':
+        revisions = [obj.root_part_revision] + list(
+            PartRevision.objects.filter(bomitem__bom_revision=obj).distinct()
+        )
+        for revision in revisions:
+            gate_error = _release_gate(revision)
+            if gate_error:
+                gate_error['detail'] = 'all BOM attachments must have a current clean ClamAV scan'
+                return Response(gate_error, status=409)
     if target == 'approved': obj.reviewer = request.user
     if target in ('release_pending','released','obsolete'): obj.publisher = request.user
     if target == 'pending_review': obj.submitter = request.user

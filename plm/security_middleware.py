@@ -28,6 +28,12 @@ class SessionSecurityMiddleware:
             )
             if invalid:
                 logout(request)
+                # A stale/revoked browser session must not prevent the
+                # anonymous login bootstrap.  Clear it, then allow the CSRF
+                # seed and login endpoint to run; every business endpoint
+                # remains fail-closed with AUTH_INVALID.
+                if request.path.endswith('/auth/csrf/') or request.path.endswith('/auth/login/'):
+                    return self.get_response(request)
                 return JsonResponse({'code': 'AUTH_INVALID', 'detail': 'session expired or revoked'}, status=401)
             request.session['authenticated_at'] = started
             request.session['last_seen_at'] = now
@@ -35,5 +41,7 @@ class SessionSecurityMiddleware:
             request.session['session_nonce'] = str(security.session_nonce)
         elif request.session.get('_auth_user_id'):
             logout(request)
+            if request.path.endswith('/auth/csrf/') or request.path.endswith('/auth/login/'):
+                return self.get_response(request)
             return JsonResponse({'code': 'AUTH_INVALID', 'detail': 'session expired or revoked'}, status=401)
         return self.get_response(request)

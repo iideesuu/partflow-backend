@@ -11,6 +11,9 @@ import io
 import json
 import os
 import uuid
+import socket
+import struct
+import hashlib
 from decimal import Decimal, InvalidOperation
 
 import boto3
@@ -21,11 +24,77 @@ from django.utils import timezone
 
 from .models import (
     BOM, BOMItem, BOMRevision, Category, ImportJob, Part, PartRevision,
-    Unit, UploadSession, ExportJob, FinalizeJob,
+    Unit, UploadSession, ExportJob, FinalizeJob, PartAttachment, AttachmentScan,
 )
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_ERRORS = 1000
+CLAMAV_MAX_BYTES = int(os.getenv('CLAMAV_MAX_BYTES', str(4 * 1024 * 1024 * 1024)))
+
+def _clamd_scan(body, timeout=1800):
+    """Scan a stream with clamd INSTREAM; returns raw daemon verdict."""
+    host, port = os.getenv('CLAMAV_HOST', 'clamav'), int(os.getenv('CLAMAV_PORT', '3310'))
+    sock = socket.create_connection((host, port), timeout=min(timeout, 30)); sock.settimeout(timeout)
+    try:
+        sock.sendall(b'zINSTREAM\0')
+        while True:
+            chunk = body.read(1024 * 1024)
+            if not chunk: break
+            sock.sendall(struct.pack('!I', len(chunk)) + chunk)
+        sock.sendall(struct.pack('!I', 0))
+        return sock.recv(4096).decode('utf-8', 'replace').strip()
+    finally:
+        sock.close()
+
+@shared_task(name='plm.scan_attachment')
+def scan_attachment(attachment_id):
+    """Fail-closed ClamAV gate.
+
+    Transparent enterprise encryption is intentionally treated as opaque: the
+    container only receives ciphertext, so a ClamAV ``OK`` verdict over those
+    bytes would be meaningless.  Such attachments stay blocked until an
+    approved endpoint scans the decrypted file and uploads it in
+    ``client_decrypted`` mode.
+    """
+    attachment = PartAttachment.objects.select_related('upload_session').get(pk=attachment_id)
+    session = attachment.upload_session
+    scan = AttachmentScan.objects.create(attachment=attachment, status='running', generation=uuid.uuid4().hex, started_at=timezone.now())
+    attachment.security_state = 'scanning'; attachment.scan_generation = scan.generation; attachment.save(update_fields=['security_state','scan_generation'])
+    if attachment.encryption_mode in ('transparent', 'unknown'):
+        scan.status = 'opaque'; scan.result = 'OPAQUE_ENCRYPTED_CONTENT'; scan.error = 'encrypted or unknown content cannot be trusted as clean; upload authorized plaintext for container scanning or integrate a trusted decryption/scan service'; scan.finished_at = timezone.now()
+        scan.save(update_fields=['status','result','error','finished_at'])
+        attachment.security_state = 'unscannable'; attachment.scan_error = scan.error; attachment.scanned_at = timezone.now()
+        attachment.save(update_fields=['security_state','scan_error','scanned_at'])
+        return {'status': 'opaque', 'code': 'ENCRYPTED_CONTENT_UNSCANNABLE', 'attachment': str(attachment.id)}
+    if session.size > CLAMAV_MAX_BYTES:
+        scan.status='error'; scan.error='UPLOAD_SIZE_EXCEEDED: ClamAV publish limit is 4 GiB'; scan.finished_at=timezone.now(); scan.save(update_fields=['status','error','finished_at'])
+        attachment.security_state='error'; attachment.scan_error=scan.error; attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scan_error','scanned_at']); return {'status':'error','code':'UPLOAD_SIZE_EXCEEDED'}
+    body = None
+    try:
+        body = s3_client().get_object(Bucket=session.bucket, Key=session.object_key)['Body']
+        digest = hashlib.sha256()
+        class Tee:
+            def read(self, n=-1):
+                data = body.read(n)
+                if data: digest.update(data)
+                return data
+        verdict = _clamd_scan(Tee())
+        scan.sha256 = digest.hexdigest(); scan.result = verdict
+        normalized_verdict = verdict.rstrip('\x00\r\n ').upper()
+        clean = normalized_verdict.endswith(': OK') or normalized_verdict == 'OK'
+        scan.status = 'clean' if clean else 'infected'; scan.engine_version = os.getenv('CLAMAV_ENGINE_VERSION','unknown'); scan.signature_version = os.getenv('CLAMAV_DB_VERSION','unknown'); scan.finished_at=timezone.now(); scan.save(update_fields=['sha256','result','status','engine_version','signature_version','finished_at'])
+        attachment.security_state = 'available' if clean else 'quarantined'; attachment.scanner_engine_version=scan.engine_version; attachment.scanner_signature_version=scan.signature_version; attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scanner_engine_version','scanner_signature_version','scanned_at'])
+        return {'status': scan.status, 'attachment': str(attachment.id)}
+    except Exception as exc:
+        scan.status='error'; scan.error=str(exc); scan.finished_at=timezone.now(); scan.save(update_fields=['status','error','finished_at'])
+        attachment.security_state='error'; attachment.scan_error=str(exc); attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scan_error','scanned_at'])
+        raise
+    finally:
+        if body is not None:
+            try:
+                body.close()
+            except Exception:
+                pass
 
 # Spreadsheet formula injection guard mandated by V1.6 §6.5.4.  Prefix
 # dangerous leading characters with a single quote while preserving the

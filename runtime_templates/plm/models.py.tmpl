@@ -144,6 +144,32 @@ class PartAttachment(models.Model):
     attachment_type = models.CharField(max_length=32, default='drawing')
     filename = models.CharField(max_length=255)
     description = models.CharField(max_length=500, blank=True)
+    # ``transparent`` means the client-side enterprise encryption layer leaves
+    # ciphertext on the wire/storage.  ClamAV cannot inspect that ciphertext;
+    # it must never be reported as a clean scan.
+    ENCRYPTION_MODES = [('unknown','Unknown encryption'),('none','No encryption'),('transparent','Transparent enterprise encryption'),('client_decrypted','Client decrypted before upload')]
+    encryption_mode = models.CharField(max_length=24, choices=ENCRYPTION_MODES, default='unknown')
+    SECURITY_STATES = [('pending','Pending scan'),('scanning','Scanning'),('available','Available'),('quarantined','Quarantined'),('unscannable','Encrypted/opaque - client scan required'),('error','Scan error')]
+    security_state = models.CharField(max_length=20, choices=SECURITY_STATES, default='pending')
+    scan_generation = models.CharField(max_length=64, blank=True)
+    scanner_engine_version = models.CharField(max_length=128, blank=True)
+    scanner_signature_version = models.CharField(max_length=128, blank=True)
+    scan_error = models.TextField(blank=True)
+    scanned_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class AttachmentScan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attachment = models.ForeignKey(PartAttachment, related_name='scans', on_delete=models.PROTECT)
+    status = models.CharField(max_length=20, default='queued')
+    generation = models.CharField(max_length=64, blank=True)
+    sha256 = models.CharField(max_length=64, blank=True)
+    engine_version = models.CharField(max_length=128, blank=True)
+    signature_version = models.CharField(max_length=128, blank=True)
+    result = models.CharField(max_length=255, blank=True)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 class AuditEvent(models.Model):
@@ -185,6 +211,25 @@ class FinalizeJob(models.Model):
     error = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+class ReleasePublication(models.Model):
+    """Durable publication record for an immutable released revision.
+
+    A revision has at most one publication.  Keeping this record in the
+    control plane makes release retries idempotent and gives operators a
+    durable audit handle without exposing MinIO credentials to clients.
+    """
+    STATUS_CHOICES = [('pending','Pending'),('published','Published'),('failed','Failed')]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    revision = models.OneToOneField('PartRevision', related_name='release_publication', on_delete=models.PROTECT)
+    operation_key = models.CharField(max_length=180, unique=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    canonical_release_key = models.CharField(max_length=512, blank=True)
+    version_id = models.CharField(max_length=255, blank=True)
+    content_sha256 = models.CharField(max_length=64, blank=True)
+    error = models.TextField(blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 

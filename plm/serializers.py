@@ -16,12 +16,20 @@ class PartRevisionSerializer(serializers.ModelSerializer):
     unit_code = serializers.CharField(source='unit.code', read_only=True)
     part_code = serializers.CharField(source='part.part_code', read_only=True)
     attachment_count = serializers.IntegerField(source='attachments.count', read_only=True)
+    publication_status = serializers.SerializerMethodField()
+    publication_id = serializers.SerializerMethodField()
+    def get_publication_status(self, obj):
+        publication = getattr(obj, 'release_publication', None)
+        return publication.status if publication else None
+    def get_publication_id(self, obj):
+        publication = getattr(obj, 'release_publication', None)
+        return str(publication.pk) if publication else None
     def validate_parameters(self, value):
         if not isinstance(value, dict): raise serializers.ValidationError('parameters must be a key/value object')
         return value
     class Meta:
         model = PartRevision
-        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','created_at']
+        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','created_at']
         read_only_fields = ['id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
         extra_kwargs = {'name': {'required': False}, 'revision': {'required': False}}
 class PartSerializer(serializers.ModelSerializer):
@@ -106,8 +114,17 @@ class PartAttachmentSerializer(serializers.ModelSerializer):
     bucket = serializers.CharField(source='upload_session.bucket', read_only=True)
     class Meta:
         model = PartAttachment
-        fields = ['id','revision','upload_session','attachment_type','filename','description','object_key','bucket','created_at']
-        read_only_fields = ['id','object_key','bucket','created_at','filename']
+        fields = ['id','revision','upload_session','attachment_type','filename','description','encryption_mode','object_key','bucket','security_state','scan_generation','scanner_engine_version','scanner_signature_version','scan_error','scanned_at','created_at']
+        read_only_fields = ['id','object_key','bucket','created_at','filename','security_state','scan_generation','scanner_engine_version','scanner_signature_version','scan_error','scanned_at']
+
+    def validate(self, attrs):
+        # Re-labelling the same ciphertext must not turn it into plaintext.
+        # A replacement object is needed when leaving the opaque path.
+        if (self.instance and self.instance.encryption_mode in ('transparent', 'unknown')
+                and attrs.get('encryption_mode') in ('none', 'client_decrypted')
+                and attrs.get('upload_session', self.instance.upload_session) == self.instance.upload_session):
+            raise serializers.ValidationError({'encryption_mode': 'upload a new authorized plaintext file; the same object cannot be relabelled as decrypted'})
+        return attrs
 
 class AuditEventSerializer(serializers.ModelSerializer):
     class Meta:

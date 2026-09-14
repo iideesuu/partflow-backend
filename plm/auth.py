@@ -1,4 +1,4 @@
-﻿import os, re
+import os, re
 from dataclasses import dataclass
 from django.contrib.auth import get_user_model
 from django.db import transaction

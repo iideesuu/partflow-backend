@@ -29,6 +29,18 @@ services:
       retries: 20
     restart: unless-stopped
 
+  clamav:
+    image: clamav/clamav:1.4.3
+    environment:
+      CLAMAV_NO_FRESHCLAMD: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "echo PING | nc -w 2 127.0.0.1 3310 | grep -q PONG"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
   web:
     build:
       context: .
@@ -71,6 +83,13 @@ services:
       AUTO_MIGRATE: ${AUTO_MIGRATE:-1}
       AUTO_COLLECTSTATIC: ${AUTO_COLLECTSTATIC:-1}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # ClamAV is an external read-only scanning prerequisite. Keep the
+      # default fail-closed when no clamd service is configured.
+      CLAMAV_HOST: ${CLAMAV_HOST:-clamav}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      CLAMAV_MAX_BYTES: ${CLAMAV_MAX_BYTES:-4294967296}
+      CLAMAV_ENGINE_VERSION: ${CLAMAV_ENGINE_VERSION:-unknown}
+      CLAMAV_DB_VERSION: ${CLAMAV_DB_VERSION:-unknown}
     ports:
       - "${WEB_PORT:-8000}:8000"
     depends_on:
@@ -78,6 +97,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      clamav:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready/', timeout=3)"]
       interval: 10s
@@ -100,6 +121,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      clamav:
+        condition: service_started
     init: true
     restart: unless-stopped
 
@@ -137,4 +160,3 @@ networks:
     # PARTFLOW_NETWORK when running more than one checkout on the same host so
     # service DNS names (especially `db`) cannot collide.
     name: ${PARTFLOW_NETWORK:-partflow_net}
-
