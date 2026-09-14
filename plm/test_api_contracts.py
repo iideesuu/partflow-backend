@@ -51,3 +51,20 @@ class APICompatibilityTests(TestCase):
         self.client.force_authenticate(self.admin)
         response = self.client.get('/api/v1/jobs/00000000-0000-0000-0000-000000000000/')
         self.assertEqual(response.status_code, 404)
+
+    def test_attachment_version_read_contract_requires_license(self):
+        from .models import Part, PartRevision, UploadSession, PartAttachment, AttachmentVersion
+        from django.utils import timezone
+        from datetime import timedelta
+        part = Part.objects.create(part_code='98.99.0001')
+        rev = PartRevision.objects.create(part=part, revision='A', name='compat attachment')
+        session = UploadSession.objects.create(filename='x.pdf', size=1, expires_at=timezone.now()+timedelta(hours=1), state='uploaded', object_key='x', bucket='plm-quarantine')
+        attachment = PartAttachment.objects.create(revision=rev, upload_session=session, filename='x.pdf', security_state='available')
+        version = AttachmentVersion.objects.create(attachment=attachment, version_id='v1', sha256='a'*64, size_bytes=1, security_state='available')
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(f'/api/v1/attachment-versions/{version.pk}/')
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get(f'/api/v1/attachment-versions/{version.pk}/content')
+        self.assertEqual(response.status_code, 403)
+        response = self.client.post(f'/api/v1/attachment-versions/{version.pk}/download', {'mode':'bad'}, format='json')
+        self.assertEqual(response.status_code, 422)

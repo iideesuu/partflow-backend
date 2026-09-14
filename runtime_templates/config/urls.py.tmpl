@@ -4,6 +4,8 @@ from plm.views import health_live, health_ready
 from plm.auth_views import csrf, login_view, me, logout_view, users
 urlpatterns=[
     path('health/', health_live),
+    path('healthz', health_live),
+    path('healthz/', health_live),
     path('health/ready/', health_ready),
     path('api/v1/', include('plm.urls')),
     path('api/v1/auth/csrf/', csrf),

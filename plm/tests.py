@@ -185,8 +185,8 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(released.status_code, 200)
         self.client.force_authenticate(self.users['engineer'])
         response = self.client.get(f'/api/v1/parts/{self.part.pk}/attachments/{attachment.pk}/download/')
-        self.assertEqual(response.status_code, 200)
-        self.assertIn('url', response.data)
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.data['code'], 'ATTACHMENT_LICENSE_REQUIRED')
 
     @patch('plm.jobs._clamd_scan')
     def test_transparent_encryption_short_circuits_clamav(self, clamd_scan):
@@ -203,6 +203,24 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(attachment.security_state, 'available')
         self.assertEqual(scan.result, 'OPAQUE_ENCRYPTED_CONTENT')
         clamd_scan.assert_not_called()
+
+    @patch('plm.jobs._clamd_scan', return_value='stream: OK')
+    @patch('plm.jobs.s3_client')
+    def test_plain_attachment_scan_marks_available(self, s3_factory, clamd_scan):
+        session = UploadSession.objects.create(
+            object_key='tests/plain-scan', bucket='test-bucket', filename='drawing.pdf',
+            size=5, expires_at=timezone.now(), state='uploaded')
+        attachment = PartAttachment.objects.create(
+            revision=self.revision, upload_session=session, filename='drawing.pdf',
+            encryption_mode='none')
+        class Body:
+            def read(self, n=-1): return b'hello' if n != 0 else b''
+            def close(self): pass
+        s3_factory.return_value.get_object.return_value = {'Body': Body()}
+        result = scan_attachment(str(attachment.pk))
+        attachment.refresh_from_db()
+        self.assertEqual(result['status'], 'clean')
+        self.assertEqual(attachment.security_state, 'available')
 
     def test_advanced_filters_and_where_used_contract(self):
         response = self.client.get('/api/v1/parts/', {'revision_state': 'draft', 'material': 'Alum', 'standard_code': 'ISO', 'is_customized': 'true'})

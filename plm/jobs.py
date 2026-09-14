@@ -90,6 +90,7 @@ def scan_attachment(attachment_id):
         verdict = _clamd_scan(Tee())
         scan.sha256 = digest.hexdigest(); scan.result = verdict
         normalized_verdict = verdict.rstrip('\x00\r\n ').upper()
+        clean = normalized_verdict == 'OK' or normalized_verdict.endswith(': OK')
         scan.status = 'clean' if clean else 'infected'; scan.engine_version = os.getenv('CLAMAV_ENGINE_VERSION','unknown'); scan.signature_version = os.getenv('CLAMAV_DB_VERSION','unknown'); scan.finished_at=timezone.now(); scan.save(update_fields=['sha256','result','status','engine_version','signature_version','finished_at'])
         attachment.security_state = 'available' if clean else 'quarantined'; attachment.scanner_engine_version=scan.engine_version; attachment.scanner_signature_version=scan.signature_version; attachment.scanned_at=timezone.now(); attachment.save(update_fields=['security_state','scanner_engine_version','scanner_signature_version','scanned_at'])
         if version is not None:

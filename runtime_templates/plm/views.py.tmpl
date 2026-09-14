@@ -5,7 +5,9 @@ from django.db import connection, transaction
 from django.db.models.deletion import ProtectedError
 from django.db.models import Q, Max, Exists, OuterRef
 from django.shortcuts import get_object_or_404
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse, StreamingHttpResponse
+from django.core import signing
+import secrets
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
@@ -471,14 +473,90 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         record_audit(self.request,'attachment.delete',instance); instance.delete()
     @action(detail=True,methods=['get'])
     def download(self, request, pk=None, **kwargs):
-        obj=self.get_object()
-        # A presigned URL is itself a download capability.  Never mint one
-        # for pending, failed, quarantined, or stale attachments.
-        if obj.security_state in ('quarantined', 'error', 'pending', 'scanning'):
-            return Response({'code':'ATTACHMENT_SCAN_REQUIRED',
-                             'detail':'attachment is unavailable until scanner disposition is clean',
-                             'security_state':obj.security_state}, status=409)
-        url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
+        # Legacy direct presign bypasses the V1.6 mode/license predicates.
+        # Keep the route discoverable but fail closed; callers must obtain a
+        # short-lived license through /attachment-versions/{id}/download.
+        return Response({'code':'ATTACHMENT_LICENSE_REQUIRED',
+                         'detail':'use the attachment-version download contract'}, status=410)
+
+# V1.6 attachment-version read contract.  These endpoints intentionally expose
+# only opaque version identifiers and short-lived licenses; storage coordinates
+# remain server-side and bytes are fetched through the content endpoint.
+ATTACHMENT_READ_ROLES = ('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
+def _attachment_version_allowed(request, version):
+    return bool(getattr(request, 'user', None) and request.user.is_authenticated
+                and user_role(request.user) in ATTACHMENT_READ_ROLES)
+
+@api_view(['GET'])
+def attachment_version_detail(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    return Response({'id': str(version.id), 'version_id': version.version_id,
+                     'filename': version.attachment.filename,
+                     'content_type': version.attachment.upload_session.content_type,
+                     'size_bytes': version.size_bytes, 'sha256': version.sha256,
+                     'security_state': version.security_state,
+                     'rescan_required': version.rescan_required,
+                     'created_at': version.created_at})
+
+@api_view(['GET'])
+def attachment_version_preview(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    if version.security_state not in ('available','opaque') or version.rescan_required:
+        return Response({'code':'ATTACHMENT_NOT_READY','detail':'attachment is not available'}, status=409)
+    return Response({'id': str(version.id), 'filename': version.attachment.filename,
+                     'content_type': version.attachment.upload_session.content_type,
+                     'size_bytes': version.size_bytes, 'preview_available': False,
+                     'security_state': version.security_state})
+
+@api_view(['POST'])
+def attachment_version_download(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    if version.security_state not in ('available','opaque') or version.rescan_required:
+        return Response({'code':'ATTACHMENT_NOT_READY','detail':'attachment is not available'}, status=409)
+    mode = str(request.data.get('mode') or request.query_params.get('mode') or 'current')
+    if mode not in ('current','draft','historical'): return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=422)
+    link_id = request.data.get('link_id') or request.query_params.get('link_id')
+    publication_id = request.data.get('release_publication_id') or request.query_params.get('release_publication_id')
+    as_of = request.data.get('as_of') or request.query_params.get('as_of')
+    if mode == 'draft' and (not link_id or publication_id):
+        return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=422)
+    if mode in ('current','historical') and (not publication_id or link_id or (mode == 'historical' and not as_of)):
+        return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=422)
+    payload = {'version_id': str(version.id), 'mode': mode, 'principal': request.user.pk,
+               'link_id': str(link_id) if link_id else None,
+               'release_publication_id': str(publication_id) if publication_id else None,
+               'as_of': str(as_of) if as_of else None,
+               'permission_version': getattr(getattr(request.user, 'security', None), 'permission_version', 1),
+               'nonce': secrets.token_urlsafe(18)}
+    license_token = signing.dumps(payload, salt='attachment-download')
+    return Response({'download_license': license_token, 'expires_in': 600,
+                     'version_id': str(version.id), 'mode': mode})
+
+@api_view(['GET'])
+def attachment_version_content(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    token = request.query_params.get('download_license') or request.headers.get('X-Download-License')
+    if not token: return Response({'code':'DOWNLOAD_LICENSE_REQUIRED'}, status=403)
+    try:
+        payload = signing.loads(token, salt='attachment-download', max_age=600)
+    except signing.BadSignature:
+        return Response({'code':'DOWNLOAD_LICENSE_INVALID'}, status=403)
+    if str(payload.get('version_id')) != str(version.id) or str(payload.get('principal')) != str(request.user.pk):
+        return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=403)
+    if version.security_state not in ('available','opaque') or version.rescan_required:
+        return Response({'code':'ATTACHMENT_NOT_READY'}, status=409)
+    try:
+        body = s3_client().get_object(Bucket=version.attachment.upload_session.bucket, Key=version.attachment.upload_session.object_key)['Body']
+    except Exception:
+        return Response({'code':'STORAGE_RECONCILIATION_FAILED'}, status=409)
+    response = StreamingHttpResponse(iter(lambda: body.read(1024 * 1024), b''), content_type=version.attachment.upload_session.content_type or 'application/octet-stream')
+    response['Content-Disposition'] = 'attachment; filename="%s"' % os.path.basename(version.attachment.filename)
+    response['Content-Length'] = str(version.size_bytes)
+    return response
 
 class AuditEventViewSet(RoleProtectedMixin, viewsets.ReadOnlyModelViewSet):
     read_roles=('admin','reviewer','publisher','auditor','sysadmin'); queryset=AuditEvent.objects.all(); serializer_class=AuditEventSerializer
@@ -501,10 +579,18 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
         bucket = settings.MINIO_BUCKET_QUARANTINE; key = f"uploads/{timezone.now():%Y/%m/%d}/{uuid.uuid4()}-{filename}"
         try:
             control = s3_control(); mpu = control.create_multipart_upload(Bucket=bucket, Key=key, ContentType=data.get('content_type') or 'application/octet-stream')
-            upload_id = mpu['UploadId']; client = s3_presign(); urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=int(os.getenv('PRESIGN_TTL','900'))) for i in range(1,chunks+1)]
+            upload_id = mpu['UploadId']; client = s3_presign(); ttl = int(os.getenv('PRESIGN_TTL','900'))
+            # Return at most one presign batch. Further parts are requested via
+            # the paged ``parts/presign`` action so a 5 GiB upload never creates
+            # thousands of URLs in one response.
+            first_batch = min(chunks, 20)
+            urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=ttl) for i in range(1, first_batch+1)]
         except Exception as exc: return Response({'detail':f'MinIO unavailable: {exc}'}, status=503)
         obj = UploadSession.objects.create(object_key=key,bucket=bucket,filename=filename,content_type=data.get('content_type') or '',size=size,total_chunks=chunks,declared_sha256=data.get('sha256') or '',upload_id=upload_id,expires_at=timezone.now()+timedelta(hours=2))
-        return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,'part_urls':urls,'expires_at':obj.expires_at}, status=201)
+        return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,
+                         'total_chunks':chunks,'part_urls':urls,'part_attempt':1,
+                         'signed_headers':{},'expected_length':size,
+                         'expires_at':obj.expires_at}, status=201)
     def retrieve(self, request, pk=None):
         try: obj=UploadSession.objects.get(pk=pk)
         except UploadSession.DoesNotExist: return Response({'detail':'not found'},status=404)
@@ -512,6 +598,10 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='parts/presign')
     def presign_parts(self, request, pk=None):
         obj=get_object_or_404(UploadSession, pk=pk)
+        if obj.expires_at <= timezone.now():
+            return Response({'code':'UPLOAD_SESSION_EXPIRED','detail':'upload session expired'}, status=409)
+        if obj.state == 'cancelled':
+            return Response({'code':'UPLOAD_SESSION_CANCELLED','detail':'upload session cancelled'}, status=409)
         if obj.state in ('uploaded','verified'): return Response({'parts':[]})
         numbers=request.data.get('part_numbers') or []
         if len(numbers)>20: return Response({'detail':'at most 20 parts per request'},status=400)
@@ -521,6 +611,31 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
         client=s3_presign(); ttl=int(os.getenv('PRESIGN_TTL','900'))
         parts=[{'part_number':n,'url':client.generate_presigned_url('upload_part',Params={'Bucket':obj.bucket,'Key':obj.object_key,'UploadId':obj.upload_id,'PartNumber':n},ExpiresIn=ttl),'expires_in':ttl} for n in numbers]
         return Response({'parts':parts})
+    @action(detail=True, methods=['get'], url_path='parts')
+    def list_parts(self, request, pk=None):
+        """Return server-side multipart receipts for resumable uploads."""
+        obj = get_object_or_404(UploadSession, pk=pk)
+        if obj.state in ('uploaded','verified'):
+            return Response({'parts': [], 'complete': True, 'missing_parts': []})
+        if not obj.upload_id:
+            return Response({'parts': [], 'complete': False, 'missing_parts': list(range(1, obj.total_chunks + 1))})
+        try:
+            control = s3_control(); remote, marker, seen_markers = [], None, set()
+            while True:
+                params = {'Bucket': obj.bucket, 'Key': obj.object_key, 'UploadId': obj.upload_id}
+                if marker: params['PartNumberMarker'] = marker
+                page = control.list_parts(**params)
+                remote.extend({'part_number': int(p['PartNumber']), 'etag': str(p['ETag']).strip('"'), 'size': int(p.get('Size') or 0)} for p in page.get('Parts', []))
+                if not page.get('IsTruncated'): break
+                marker = str(page.get('NextPartNumberMarker') or '')
+                if not marker or marker in seen_markers:
+                    raise ValueError('STORAGE_RECONCILIATION_FAILED')
+                seen_markers.add(marker)
+            present = {p['part_number'] for p in remote}
+            return Response({'parts': remote, 'complete': len(present) == obj.total_chunks,
+                             'missing_parts': [n for n in range(1, obj.total_chunks + 1) if n not in present]})
+        except Exception as exc:
+            return Response({'code':'STORAGE_RECONCILIATION_FAILED','detail':str(exc)}, status=409)
     @action(detail=True, methods=['post'], url_path='complete')
     def complete(self, request, pk=None):
         try: obj=UploadSession.objects.get(pk=pk)

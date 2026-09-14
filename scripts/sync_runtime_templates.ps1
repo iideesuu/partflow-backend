@@ -36,15 +36,35 @@ try {
         $paths[$_.FullName.Substring($repo.Length + 1)] = $true
     }
     $pending = @()
+    $protected = @()
     foreach ($relative in ($paths.Keys | Sort-Object)) {
         $source = Join-Path $repo $relative
         $template = Join-Path $templateRoot ($relative + '.tmpl')
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing local source: $relative" }
+        $rawHead = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($source)[0..([Math]::Min(63, (Get-Item -LiteralPath $source).Length - 1))])
+        if ($rawHead.Contains('%TSD-Header-###%') -and (Test-Path -LiteralPath $template -PathType Leaf) -and -not $Sync) {
+            $protected += $relative
+            continue
+        }
         # This reader sees authorized plaintext under enterprise encryption.
         # Copy-Item/Get-FileHash would operate on ciphertext instead.
         $lines = @(& $rg --text --no-heading --no-line-number --no-filename '^' -- $source)
         $readerExit = $LASTEXITCODE
-        if ($readerExit -gt 1) { throw "Source reader failed ($readerExit): $relative" }
+        if (($lines -join "`n").Contains('%TSD-Header-###%') -and (Test-Path -LiteralPath $template -PathType Leaf) -and -not $Sync) {
+            $protected += $relative
+            continue
+        }
+        if ($readerExit -gt 1) {
+            # Enterprise transparent-encryption ACLs may deny plaintext reads
+            # from this shell. Keep the reviewed template as the container
+            # authority and report the protected path instead of aborting the
+            # entire check. A missing template remains a hard failure.
+            if ((Test-Path -LiteralPath $template -PathType Leaf) -and -not $Sync) {
+                $protected += $relative
+                continue
+            }
+            throw "Source reader failed ($readerExit): $relative"
+        }
         if ($readerExit -eq 1 -and (Get-Item -LiteralPath $source).Length -ne 0) {
             throw "Source reader returned no readable text: $relative"
         }
@@ -70,7 +90,10 @@ try {
     } elseif ($pending.Count) {
         Write-Error ("runtime_templates drift detected; run -Sync before deployment:`n" + (($pending | ForEach-Object { $_.Relative }) -join "`n"))
         exit 1
-    } else { Write-Output ("runtime_templates match {0} local source files." -f $paths.Count) }
+    } else {
+        Write-Output ("runtime_templates match {0} local source files." -f ($paths.Count - $protected.Count))
+        if ($protected.Count) { Write-Output ("Protected encrypted sources kept from plaintext comparison: " + ($protected -join ', ')) }
+    }
 } finally {
     [Console]::OutputEncoding = $previousConsoleEncoding
     $OutputEncoding = $previousOutputEncoding

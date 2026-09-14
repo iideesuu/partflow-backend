@@ -5,6 +5,7 @@ SECRET_KEY=os.getenv('DJANGO_SECRET_KEY','dev'); DEBUG=os.getenv('DJANGO_DEBUG',
 INSTALLED_APPS=['django.contrib.auth','django.contrib.contenttypes','django.contrib.sessions','django.contrib.staticfiles','rest_framework','drf_spectacular','plm']
 MIDDLEWARE=['django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','plm.security_middleware.SessionSecurityMiddleware','config.etag_middleware.ETagMiddleware']
 ROOT_URLCONF='config.urls'; WSGI_APPLICATION='config.wsgi.application'; USE_TZ=True; TIME_ZONE='Asia/Shanghai'; DEFAULT_AUTO_FIELD='django.db.models.BigAutoField'
+CACHES={'default': {'BACKEND':'django.core.cache.backends.redis.RedisCache', 'LOCATION': os.getenv('REDIS_URL','redis://redis:6379/2')}}
 TEMPLATES=[{'BACKEND':'django.template.backends.django.DjangoTemplates','DIRS':[],'APP_DIRS':True,'OPTIONS':{'context_processors':['django.template.context_processors.request','django.contrib.auth.context_processors.auth','django.contrib.messages.context_processors.messages']}}]
 _db = {'ENGINE':'django.db.backends.postgresql','NAME':os.getenv('POSTGRES_DB','partflow'),'USER':os.getenv('POSTGRES_USER','partflow'),'PASSWORD':os.getenv('POSTGRES_PASSWORD',''),'HOST':os.getenv('POSTGRES_HOST','db'),'PORT':os.getenv('POSTGRES_PORT','5432')}
 if os.getenv('PLM_ALLOW_SQLITE','0') == '1' and not os.getenv('POSTGRES_HOST'):
