@@ -55,6 +55,34 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.client.patch(self.detail, {'name': 'Changed'}, format='json').status_code, 400)
         self.assertEqual(self.client.delete(self.detail).status_code, 405)
 
+    def test_submitter_cannot_review_or_publish_and_can_withdraw_with_reason(self):
+        # Submit records the actor, and the same actor is excluded from every
+        # later review/publish decision (SoD-1/SoD-2).
+        self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
+        self.revision.refresh_from_db()
+        self.assertEqual(self.revision.submitter_id, self.users['engineer'].id)
+        self.assertEqual(self.transition('draft', 'engineer').status_code, 422)
+        withdrawn = self.client.post(f'{self.detail}transition/', {'action':'withdraw','reason':'补充设计输入'}, format='json')
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.data)
+        self.revision.refresh_from_db()
+        self.assertEqual(self.revision.revision_state, 'draft')
+
+        # A different reviewer may approve, but that reviewer cannot publish.
+        self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
+        self.revision.submitter_id = self.users['reviewer'].id
+        self.revision.save(update_fields=['submitter'])
+        self.assertEqual(self.transition('approved', 'reviewer').status_code, 409)
+        self.revision.submitter_id = self.users['engineer'].id
+        self.revision.save(update_fields=['submitter'])
+        self.assertEqual(self.transition('approved', 'reviewer').status_code, 200)
+        self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
+        self.revision.reviewer_id = self.users['publisher'].id
+        self.revision.save(update_fields=['reviewer'])
+        self.client.force_authenticate(self.users['publisher'])
+        published = self.client.post(f'{self.detail}transition/', {'state':'released'}, format='json')
+        self.assertEqual(published.status_code, 409)
+        self.assertEqual(published.data['code'], 'SOD_VIOLATION')
+
     def test_conflict_does_not_change_revision_or_audit(self):
         before = AuditEvent.objects.count()
         response = self.client.patch(self.detail, {'name': 'Changed'}, format='json', HTTP_IF_MATCH='"99"')

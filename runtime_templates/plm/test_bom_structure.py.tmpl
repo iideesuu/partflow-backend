@@ -41,7 +41,10 @@ class BOMStructureTests(TestCase):
         stale = self.client.patch(detail, {'quantity': '3'}, format='json', HTTP_IF_MATCH='1')
         self.assertEqual(stale.status_code, 412)
         self.assertEqual(AuditEvent.objects.count(), before)
-        self.assertEqual(self.client.delete(detail, HTTP_IF_MATCH='3').status_code, 409)
+        # Generic DELETE is intentionally disabled; use the audited action.
+        self.assertEqual(self.client.delete(detail, HTTP_IF_MATCH='3').status_code, 405)
+        action_url = f"{self.url}{created.data['id']}/actions/"
+        self.assertEqual(self.client.post(action_url, {'action': 'delete'}, format='json', HTTP_IF_MATCH='3').status_code, 409)
 
     def test_position_uniqueness_is_per_parent_and_invalid_quantity_is_atomic(self):
         first = self.post()
@@ -93,3 +96,12 @@ class BOMStructureTests(TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.data['code'], 'BOM_TREE_BUDGET_EXCEEDED')
         self.assertEqual(BOMItem.objects.count(), 15)
+
+    def test_legacy_nested_write_route_is_disabled(self):
+        """Writes must use the locked canonical endpoint with If-Match."""
+        url = f'/api/v1/boms/{self.bom.pk}/revisions/{self.revision.pk}/items/'
+        before = BOMItem.objects.count()
+        response = self.client.post(url, self.payload(), format='json')
+        self.assertEqual(response.status_code, 410, response.data)
+        self.assertEqual(response.data['code'], 'LEGACY_BOM_WRITE_ROUTE')
+        self.assertEqual(BOMItem.objects.count(), before)

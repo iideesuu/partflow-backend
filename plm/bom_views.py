@@ -79,7 +79,9 @@ class BOMItemViewSet(viewsets.ModelViewSet):
     read_roles = ('engineer', 'reviewer', 'publisher', 'auditor', 'viewer', 'sysadmin', 'admin')
     write_roles = ('engineer',)
     serializer_class = BOMItemSerializer
-    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+    # Row deletion is an explicit action in the V1.6 contract; disabling the
+    # generic DELETE prevents clients from bypassing action auditing.
+    http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
         return BOMItem.objects.filter(bom_revision_id=self.kwargs['bom_revision_pk']).select_related('child_part_revision__part', 'unit', 'parent_item').order_by('line_no')
@@ -111,10 +113,13 @@ class BOMItemViewSet(viewsets.ModelViewSet):
         record_change(request, revision, 'bom.item.update', result)
         return Response(self.get_serializer(result).data, headers={'ETag': f'"{revision.row_version}"'})
 
+    @action(detail=True, methods=['post'], url_path='actions')
     @transaction.atomic
-    def destroy(self, request, *args, **kwargs):
+    def actions(self, request, *args, **kwargs):
         revision = lock_revision(request, self.kwargs['bom_revision_pk'])
         obj = self.get_object()
+        if str(request.data.get('action') or '').lower() != 'delete':
+            raise BOMWriteError('ACTION_NOT_SUPPORTED', 'Only the delete action is supported for BOM rows.')
         if obj.children.exists():
             raise BOMWriteError('BOM_ITEM_HAS_CHILDREN', 'Remove or move child rows before deleting this row.', 409)
         record_change(request, revision, 'bom.item.delete', obj)

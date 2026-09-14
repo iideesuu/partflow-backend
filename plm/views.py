@@ -3,7 +3,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.db import connection, transaction
 from django.db.models.deletion import ProtectedError
-from django.db.models import Q, Max
+from django.db.models import Q, Max, Exists, OuterRef
 from django.shortcuts import get_object_or_404
 from django.http import JsonResponse
 from django.utils import timezone
@@ -160,21 +160,57 @@ class PartViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
     queryset = Part.objects.select_related('category').prefetch_related('revisions'); serializer_class = PartSerializer
     def get_queryset(self):
         qs = super().get_queryset(); p=self.request.query_params
-        for param, field in [('major_code','category__major_code'),('minor_code','category__minor_code'),('category_id','category_id'),('status','status'),('lifecycle','revisions__business_lifecycle'),('kind','revisions__kind'),('revision_state','revisions__revision_state')]:
-            if p.get(param): qs=qs.filter(**{field:p[param]})
-        for field in ('manufacturer','manufacturer_part_number','standard_code','material','rohs_standard'):
-            if p.get(field): qs=qs.filter(**{f'revisions__{field}__icontains':p[field]})
-        if p.get('is_customized') in ('true','false'): qs=qs.filter(revisions__is_customized=(p['is_customized']=='true'))
+        # Revision predicates must be evaluated against one *same* revision.
+        # Chaining ``revisions__...`` filters lets Django join the relation
+        # repeatedly, so e.g. ``kind=assembly&revision_state=released`` could
+        # incorrectly match an assembly draft plus an unrelated released
+        # revision.  Build one correlated EXISTS predicate instead.
+        revision_filters = {}
+        for param, field in [('lifecycle','business_lifecycle'),
+                             ('kind','kind'),
+                             ('revision_state','revision_state'),
+                             ('manufacturer','manufacturer'),
+                             ('manufacturer_part_number','manufacturer_part_number'),
+                             ('standard_code','standard_code'),
+                             ('material','material'),
+                             ('rohs_standard','rohs_standard')]:
+            value = p.get(param)
+            if value:
+                revision_filters[field] = value if param in ('lifecycle','kind','revision_state') else value
+                if param not in ('lifecycle','kind','revision_state'):
+                    revision_filters[field + '__icontains'] = revision_filters.pop(field)
+        if p.get('is_customized') in ('true','false'):
+            revision_filters['is_customized'] = p['is_customized'] == 'true'
         if p.get('q'):
-            q=p['q']; search=Q(part_code__icontains=q)
-            for field in ['name','standard_code','material','manufacturer','manufacturer_part_number','description','parameters']:
-                search |= Q(**{f'revisions__{field}__icontains':q})
-            qs=qs.filter(search)
-        return qs.distinct()
+            q = p['q']
+            revision_filters_q = Q(name__icontains=q) | Q(standard_code__icontains=q) | Q(material__icontains=q) | Q(manufacturer__icontains=q) | Q(manufacturer_part_number__icontains=q) | Q(description__icontains=q) | Q(parameters__icontains=q)
+            rev_exists = PartRevision.objects.filter(part=OuterRef('pk'), **revision_filters).filter(revision_filters_q)
+            qs = qs.annotate(_matching_revision=Exists(rev_exists)).filter(Q(part_code__icontains=q) | Q(_matching_revision=True))
+        elif revision_filters:
+            qs = qs.annotate(_matching_revision=Exists(PartRevision.objects.filter(part=OuterRef('pk'), **revision_filters))).filter(_matching_revision=True)
+        for param, field in [('major_code','category__major_code'),('minor_code','category__minor_code'),('category_id','category_id'),('status','status')]:
+            if p.get(param): qs = qs.filter(**{field:p[param]})
+        return qs
     @action(detail=True, methods=['get'], url_path='latest-revision')
     def latest_revision(self, request, pk=None):
         part = self.get_object(); rev = part.revisions.order_by('-revision_seq').first()
         if not rev: return Response({'detail':'no revision'}, status=404)
+        return Response(PartRevisionSerializer(rev).data)
+
+    @action(detail=True, methods=['get'], url_path='effective-revision')
+    def effective_revision(self, request, pk=None):
+        """Return the revision currently valid for product queries.
+
+        Draft and pending revisions are intentionally excluded: callers that
+        need work-in-progress data can use ``latest-revision`` explicitly.
+        This gives the workbench and BOM selectors a stable, publish-safe
+        query surface and a deterministic 404 when no released revision
+        exists.
+        """
+        part = self.get_object()
+        rev = part.revisions.filter(revision_state='released').order_by('-revision_seq').first()
+        if rev is None:
+            return Response({'code': 'NO_EFFECTIVE_REVISION', 'detail': 'part has no released revision'}, status=404)
         return Response(PartRevisionSerializer(rev).data)
     @action(detail=True, methods=['get'], url_path='where-used')
     def where_used(self, request, pk=None):
@@ -249,10 +285,15 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         if request.method == 'GET':
             qs=br.items.select_related('child_part_revision__part','unit').order_by('line_no')
             return Response(BOMItemSerializer(qs,many=True).data)
-        payload=request.data.copy(); payload['bom_revision']=str(br.id)
-        ser=BOMItemSerializer(data=payload); ser.is_valid(raise_exception=True)
-        obj=ser.save(); record_audit(request,'bom.item.create',obj)
-        return Response(BOMItemSerializer(obj).data,status=201)
+        # This legacy nested write route predates the canonical
+        # ``/bom-revisions/{id}/items`` endpoint.  Leaving it writable would
+        # bypass the revision row lock and If-Match concurrency guard used by
+        # the canonical viewset.  Keep GET compatibility, but fail writes
+        # explicitly with a stable migration error so clients can upgrade.
+        return Response({
+            'code': 'LEGACY_BOM_WRITE_ROUTE',
+            'detail': 'Use POST /api/v1/bom-revisions/{revision_id}/items/ with If-Match.',
+        }, status=410)
 
 class NumberRequestViewSet(RoleProtectedMixin, viewsets.ViewSet):
     read_roles=('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin'); write_roles=('engineer','admin')
@@ -303,27 +344,41 @@ class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
         obj=get_object_or_404(PartRevision.objects.select_for_update(),pk=pk,part=part)
         action=str(request.data.get('action') or '').lower()
-        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'draft','retire':'obsolete','withdraw':'draft','revise':'draft'}
+        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
         target=action_map.get(action, str(request.data.get('state') or request.data.get('revision_state') or '').lower())
         role=user_role(request.user)
         role_targets={'engineer':{'pending_review','draft'},'reviewer':{'approved','rejected'},'publisher':{'release_pending','released','release_failed','obsolete'}}
-        if role!='admin' and target not in role_targets.get(role,set()): raise PermissionDenied('this transition is not permitted for your role')
+        abandoning = obj.revision_state == 'release_failed' and target == 'approved'
+        if abandoning:
+            if role not in ('publisher','admin'): raise PermissionDenied('only a publisher may abandon a failed publication')
+        elif role!='admin' and target not in role_targets.get(role,set()): raise PermissionDenied('this transition is not permitted for your role')
         expected=request.headers.get('If-Match')
         if expected and str(obj.row_version)!=expected.strip('"'): raise Conflict()
-        allowed={'draft':{'pending_review'},'pending_review':{'approved','rejected'},'rejected':{'draft'},'approved':{'release_pending'},'release_pending':{'released','release_failed'},'release_failed':{'release_pending'},'released':{'obsolete'},'obsolete':set()}
+        allowed={'draft':{'pending_review'},'pending_review':{'approved','rejected','draft'},'rejected':{'draft'},'approved':{'release_pending'},'release_pending':{'released','release_failed'},'release_failed':{'release_pending','approved'},'released':{'obsolete'},'obsolete':set()}
         if target not in allowed.get(obj.revision_state, set()):
             return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
         if target == 'rejected' and not str(request.data.get('reason') or request.data.get('comment') or '').strip():
             return Response({'code':'REJECT_REASON_REQUIRED','detail':'reason is required'}, status=422)
+        if target == 'draft' and obj.revision_state == 'pending_review':
+            if obj.submitter_id != request.user.id:
+                return Response({'code':'SOD_VIOLATION','detail':'only the submitter may withdraw a pending revision'}, status=409)
+            if not str(request.data.get('reason') or request.data.get('comment') or '').strip():
+                return Response({'code':'WITHDRAW_REASON_REQUIRED','detail':'reason is required'}, status=422)
+        if target in ('approved','rejected') and not abandoning and obj.submitter_id == request.user.id:
+            return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own revision'}, status=409)
+        if target in ('release_pending','released'):
+            if obj.submitter_id == request.user.id or obj.reviewer_id == request.user.id:
+                return Response({'code':'SOD_VIOLATION','detail':'submitter or reviewer cannot publish own revision'}, status=409)
+        if abandoning and ReleasePublication.objects.filter(revision=obj, status='published').exists():
+            return Response({'code':'PUBLICATION_ALREADY_COMMITTED','detail':'a published revision cannot return to approved'}, status=409)
         if target == 'released':
             blocked = _release_gate(obj)
             if blocked:
                 return Response(blocked, status=409)
-        if target == 'approved' and role == 'reviewer' and obj.part.revisions.filter(pk=obj.pk,).exists() and getattr(obj, 'submitter_id', None) == request.user.id:
-            return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own revision'}, status=409)
-        if target == 'approved': obj.reviewer = request.user
+        if target == 'pending_review': obj.submitter = request.user
+        if target == 'approved' and not abandoning: obj.reviewer = request.user
         if target in ('release_pending','released','obsolete'): obj.publisher = request.user
-        obj.revision_state=target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','reviewer','publisher'])
+        obj.revision_state=target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','submitter','reviewer','publisher'])
         if target == 'released':
             # Durable, unique publication handle: repeated release retries
             # return the same publication instead of creating duplicates.
@@ -560,20 +615,29 @@ def bom_revision_actions(request, pk=None):
     if str(obj.bom.bom_type).upper() != 'EBOM':
         return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM is supported'}, status=422)
     action = str(request.data.get('action') or '').lower()
-    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'draft','retire':'obsolete','withdraw':'draft','revise':'draft'}
+    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
     target = action_map.get(action, str(request.data.get('state') or '').lower())
     role = user_role(request.user)
-    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'release_pending','released','release_failed','obsolete'}}
+    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'approved','release_pending','released','release_failed','obsolete'}}
     if role != 'admin' and target not in role_targets.get(role, set()):
         return Response({'detail':'this transition is not permitted for your role'}, status=403)
     expected = request.headers.get('If-Match')
     if expected and str(obj.row_version) != expected.strip('"'):
         return Response({'code':'CONCURRENT_MODIFICATION','current_row_version':obj.row_version}, status=409)
-    allowed = {'draft': {'pending_review'}, 'pending_review': {'approved','rejected'}, 'rejected': {'draft'}, 'approved': {'release_pending'}, 'release_pending': {'released','release_failed'}, 'release_failed': {'release_pending'}, 'released': {'obsolete'}, 'obsolete': set()}
+    allowed = {'draft': {'pending_review'}, 'pending_review': {'approved','rejected','draft'}, 'rejected': {'draft'}, 'approved': {'release_pending'}, 'release_pending': {'released','release_failed'}, 'release_failed': {'release_pending','approved'}, 'released': {'obsolete'}, 'obsolete': set()}
     if target not in allowed.get(obj.revision_state, set()):
         return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
     if target == 'rejected' and not str(request.data.get('reason') or '').strip():
         return Response({'code':'REJECT_REASON_REQUIRED','detail':'reason is required'}, status=422)
+    if target == 'draft' and obj.revision_state == 'pending_review':
+        if obj.submitter_id != request.user.id:
+            return Response({'code':'SOD_VIOLATION','detail':'only the submitter may withdraw a pending BOM revision'}, status=409)
+        if not str(request.data.get('reason') or '').strip():
+            return Response({'code':'WITHDRAW_REASON_REQUIRED','detail':'reason is required'}, status=422)
+    if target in ('approved','rejected') and obj.submitter_id == request.user.id:
+        return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own BOM revision'}, status=409)
+    if target == 'released' and (obj.submitter_id == request.user.id or obj.reviewer_id == request.user.id):
+        return Response({'code':'SOD_VIOLATION','detail':'submitter or reviewer cannot publish own BOM revision'}, status=409)
     if target == 'released' and obj.items.filter(child_part_revision__revision_state__in=['draft','pending_review','approved','release_failed','obsolete']).exists():
         return Response({'code':'REFERENCED_REVISION_NOT_RELEASED','detail':'all BOM child revisions must be released'}, status=409)
     if target == 'released':
