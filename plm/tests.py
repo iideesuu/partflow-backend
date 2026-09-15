@@ -129,6 +129,42 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(Part.objects.filter(part_code='9801-00002').exists())
 
+    def test_revision_serializer_exposes_teamcenter_style_allowed_actions(self):
+        # Detail and nested revision payloads share the same action contract.
+        self.client.force_authenticate(self.users['engineer'])
+        response = self.client.get(self.detail)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['allowed_actions'], ['submit'])
+        self.assertTrue(response.data['can_edit'])
+        nested = self.client.get(f'/api/v1/parts/{self.part.pk}/')
+        self.assertEqual(nested.status_code, 200, nested.data)
+        self.assertEqual(nested.data['revisions'][0]['allowed_actions'], ['submit'])
+
+        # Missing request context must never grant actions to background code.
+        from .serializers import PartRevisionSerializer
+        self.assertEqual(PartRevisionSerializer(self.revision).data['allowed_actions'], [])
+        self.assertFalse(PartRevisionSerializer(self.revision).data['can_edit'])
+
+        self.transition('pending_review', 'engineer')
+        self.client.force_authenticate(self.users['reviewer'])
+        pending = self.client.get(self.detail)
+        self.assertEqual(pending.data['allowed_actions'], ['approve', 'reject'])
+        self.revision.submitter_id = self.users['reviewer'].id
+        self.revision.save(update_fields=['submitter'])
+        self.assertEqual(self.client.get(self.detail).data['allowed_actions'], [])
+
+        # A publisher can only complete a pending release after SoD checks.
+        self.revision.submitter_id = self.users['engineer'].id
+        self.revision.revision_state = 'approved'
+        self.revision.reviewer_id = self.users['reviewer'].id
+        self.revision.save(update_fields=['submitter','revision_state','reviewer'])
+        self.client.force_authenticate(self.users['publisher'])
+        self.assertEqual(self.client.get(self.detail).data['allowed_actions'], ['publish'])
+        self.revision.revision_state = 'release_pending'; self.revision.save(update_fields=['revision_state'])
+        self.assertEqual(self.client.get(self.detail).data['allowed_actions'], ['release'])
+        self.revision.reviewer_id = self.users['publisher'].id; self.revision.save(update_fields=['reviewer'])
+        self.assertEqual(self.client.get(self.detail).data['allowed_actions'], [])
+
     def test_attachment_writes_are_draft_only_and_scoped_to_part(self):
         session = UploadSession.objects.create(
             object_key='tests/attachment', bucket='test-bucket', filename='drawing.pdf',

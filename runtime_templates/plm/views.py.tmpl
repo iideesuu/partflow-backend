@@ -352,7 +352,7 @@ class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
         obj=get_object_or_404(PartRevision.objects.select_for_update(),pk=pk,part=part)
         action=str(request.data.get('action') or '').lower()
-        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
+        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','release':'released','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
         target=action_map.get(action, str(request.data.get('state') or request.data.get('revision_state') or '').lower())
         role=user_role(request.user)
         role_targets={'engineer':{'pending_review','draft'},'reviewer':{'approved','rejected'},'publisher':{'release_pending','released','release_failed','obsolete'}}
