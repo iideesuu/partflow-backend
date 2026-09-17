@@ -5,7 +5,9 @@ from django.db import connection, transaction
 from django.db.models.deletion import ProtectedError
 from django.db.models import Q, Max, Exists, OuterRef
 from django.shortcuts import get_object_or_404
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse, StreamingHttpResponse
+from django.core import signing
+import secrets
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
@@ -17,7 +19,7 @@ from .models import *
 from .serializers import *
 from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url
 from .roles import RolePermission, user_role
-from .bom_services import validate_bom_tree
+from .bom_services import BOMValidationError, validate_bom_tree
 
 def record_audit(request, action, obj=None, **details):
     return AuditEvent.objects.create(actor=request.user.username, action=action,
@@ -276,7 +278,7 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         if str(bom.bom_type).upper() != 'EBOM':
             return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM revisions are supported'}, status=422)
         if request.method == 'GET':
-            return Response(BOMRevisionSerializer(bom.revisions.select_related('root_part_revision__part').prefetch_related('items__child_part_revision__part','items__unit'), many=True).data)
+            return Response(BOMRevisionSerializer(bom.revisions.select_related('root_part_revision__part').prefetch_related('items__child_part_revision__part','items__unit'), many=True, context={'request': request}).data)
         latest=bom.revisions.order_by('-revision').first()
         root_id=request.data.get('root_part_revision') or (str(latest.root_part_revision_id) if latest else None)
         if not root_id: raise ValidationError({'root_part_revision':'required'})
@@ -284,7 +286,7 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         rev=request.data.get('revision') or chr(65 + bom.revisions.count())
         obj=BOMRevision.objects.create(bom=bom,revision=rev,root_part_revision=root,revision_state='draft')
         record_audit(request,'bom.revision.create',obj)
-        return Response(BOMRevisionSerializer(obj).data,status=201)
+        return Response(BOMRevisionSerializer(obj, context={'request': request}).data,status=201)
     @action(detail=True, methods=['get','post'], url_path=r'revisions/(?P<revision_id>[^/.]+)/items')
     def revision_items(self, request, pk=None, revision_id=None):
         bom=self.get_object(); br=get_object_or_404(BOMRevision,pk=revision_id,bom=bom)
@@ -350,7 +352,7 @@ class PartRevisionViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         part=get_object_or_404(Part.objects.select_for_update(),pk=self.kwargs['part_pk'])
         obj=get_object_or_404(PartRevision.objects.select_for_update(),pk=pk,part=part)
         action=str(request.data.get('action') or '').lower()
-        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
+        action_map={'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','release':'released','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
         target=action_map.get(action, str(request.data.get('state') or request.data.get('revision_state') or '').lower())
         role=user_role(request.user)
         role_targets={'engineer':{'pending_review','draft'},'reviewer':{'approved','rejected'},'publisher':{'release_pending','released','release_failed','obsolete'}}
@@ -471,14 +473,90 @@ class PartAttachmentViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         record_audit(self.request,'attachment.delete',instance); instance.delete()
     @action(detail=True,methods=['get'])
     def download(self, request, pk=None, **kwargs):
-        obj=self.get_object()
-        # A presigned URL is itself a download capability.  Never mint one
-        # for pending, failed, quarantined, or stale attachments.
-        if obj.security_state in ('quarantined', 'error', 'pending', 'scanning'):
-            return Response({'code':'ATTACHMENT_SCAN_REQUIRED',
-                             'detail':'attachment is unavailable until scanner disposition is clean',
-                             'security_state':obj.security_state}, status=409)
-        url=s3_client().generate_presigned_url('get_object',Params={'Bucket':obj.upload_session.bucket,'Key':obj.upload_session.object_key},ExpiresIn=3600); return Response({'url':url,'expires_in':3600})
+        # Legacy direct presign bypasses the V1.6 mode/license predicates.
+        # Keep the route discoverable but fail closed; callers must obtain a
+        # short-lived license through /attachment-versions/{id}/download.
+        return Response({'code':'ATTACHMENT_LICENSE_REQUIRED',
+                         'detail':'use the attachment-version download contract'}, status=410)
+
+# V1.6 attachment-version read contract.  These endpoints intentionally expose
+# only opaque version identifiers and short-lived licenses; storage coordinates
+# remain server-side and bytes are fetched through the content endpoint.
+ATTACHMENT_READ_ROLES = ('viewer','engineer','reviewer','publisher','auditor','sysadmin','admin')
+def _attachment_version_allowed(request, version):
+    return bool(getattr(request, 'user', None) and request.user.is_authenticated
+                and user_role(request.user) in ATTACHMENT_READ_ROLES)
+
+@api_view(['GET'])
+def attachment_version_detail(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    return Response({'id': str(version.id), 'version_id': version.version_id,
+                     'filename': version.attachment.filename,
+                     'content_type': version.attachment.upload_session.content_type,
+                     'size_bytes': version.size_bytes, 'sha256': version.sha256,
+                     'security_state': version.security_state,
+                     'rescan_required': version.rescan_required,
+                     'created_at': version.created_at})
+
+@api_view(['GET'])
+def attachment_version_preview(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    if version.security_state not in ('available','opaque') or version.rescan_required:
+        return Response({'code':'ATTACHMENT_NOT_READY','detail':'attachment is not available'}, status=409)
+    return Response({'id': str(version.id), 'filename': version.attachment.filename,
+                     'content_type': version.attachment.upload_session.content_type,
+                     'size_bytes': version.size_bytes, 'preview_available': False,
+                     'security_state': version.security_state})
+
+@api_view(['POST'])
+def attachment_version_download(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    if version.security_state not in ('available','opaque') or version.rescan_required:
+        return Response({'code':'ATTACHMENT_NOT_READY','detail':'attachment is not available'}, status=409)
+    mode = str(request.data.get('mode') or request.query_params.get('mode') or 'current')
+    if mode not in ('current','draft','historical'): return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=422)
+    link_id = request.data.get('link_id') or request.query_params.get('link_id')
+    publication_id = request.data.get('release_publication_id') or request.query_params.get('release_publication_id')
+    as_of = request.data.get('as_of') or request.query_params.get('as_of')
+    if mode == 'draft' and (not link_id or publication_id):
+        return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=422)
+    if mode in ('current','historical') and (not publication_id or link_id or (mode == 'historical' and not as_of)):
+        return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=422)
+    payload = {'version_id': str(version.id), 'mode': mode, 'principal': request.user.pk,
+               'link_id': str(link_id) if link_id else None,
+               'release_publication_id': str(publication_id) if publication_id else None,
+               'as_of': str(as_of) if as_of else None,
+               'permission_version': getattr(getattr(request.user, 'security', None), 'permission_version', 1),
+               'nonce': secrets.token_urlsafe(18)}
+    license_token = signing.dumps(payload, salt='attachment-download')
+    return Response({'download_license': license_token, 'expires_in': 600,
+                     'version_id': str(version.id), 'mode': mode})
+
+@api_view(['GET'])
+def attachment_version_content(request, version_id):
+    version = get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__upload_session'), pk=version_id)
+    if not _attachment_version_allowed(request, version): return Response({'detail':'not found'}, status=404)
+    token = request.query_params.get('download_license') or request.headers.get('X-Download-License')
+    if not token: return Response({'code':'DOWNLOAD_LICENSE_REQUIRED'}, status=403)
+    try:
+        payload = signing.loads(token, salt='attachment-download', max_age=600)
+    except signing.BadSignature:
+        return Response({'code':'DOWNLOAD_LICENSE_INVALID'}, status=403)
+    if str(payload.get('version_id')) != str(version.id) or str(payload.get('principal')) != str(request.user.pk):
+        return Response({'code':'ATTACHMENT_CONTEXT_INVALID'}, status=403)
+    if version.security_state not in ('available','opaque') or version.rescan_required:
+        return Response({'code':'ATTACHMENT_NOT_READY'}, status=409)
+    try:
+        body = s3_client().get_object(Bucket=version.attachment.upload_session.bucket, Key=version.attachment.upload_session.object_key)['Body']
+    except Exception:
+        return Response({'code':'STORAGE_RECONCILIATION_FAILED'}, status=409)
+    response = StreamingHttpResponse(iter(lambda: body.read(1024 * 1024), b''), content_type=version.attachment.upload_session.content_type or 'application/octet-stream')
+    response['Content-Disposition'] = 'attachment; filename="%s"' % os.path.basename(version.attachment.filename)
+    response['Content-Length'] = str(version.size_bytes)
+    return response
 
 class AuditEventViewSet(RoleProtectedMixin, viewsets.ReadOnlyModelViewSet):
     read_roles=('admin','reviewer','publisher','auditor','sysadmin'); queryset=AuditEvent.objects.all(); serializer_class=AuditEventSerializer
@@ -501,10 +579,18 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
         bucket = settings.MINIO_BUCKET_QUARANTINE; key = f"uploads/{timezone.now():%Y/%m/%d}/{uuid.uuid4()}-{filename}"
         try:
             control = s3_control(); mpu = control.create_multipart_upload(Bucket=bucket, Key=key, ContentType=data.get('content_type') or 'application/octet-stream')
-            upload_id = mpu['UploadId']; client = s3_presign(); urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=int(os.getenv('PRESIGN_TTL','900'))) for i in range(1,chunks+1)]
+            upload_id = mpu['UploadId']; client = s3_presign(); ttl = int(os.getenv('PRESIGN_TTL','900'))
+            # Return at most one presign batch. Further parts are requested via
+            # the paged ``parts/presign`` action so a 5 GiB upload never creates
+            # thousands of URLs in one response.
+            first_batch = min(chunks, 20)
+            urls = [client.generate_presigned_url('upload_part', Params={'Bucket':bucket,'Key':key,'UploadId':upload_id,'PartNumber':i}, ExpiresIn=ttl) for i in range(1, first_batch+1)]
         except Exception as exc: return Response({'detail':f'MinIO unavailable: {exc}'}, status=503)
         obj = UploadSession.objects.create(object_key=key,bucket=bucket,filename=filename,content_type=data.get('content_type') or '',size=size,total_chunks=chunks,declared_sha256=data.get('sha256') or '',upload_id=upload_id,expires_at=timezone.now()+timedelta(hours=2))
-        return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,'part_urls':urls,'expires_at':obj.expires_at}, status=201)
+        return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,
+                         'total_chunks':chunks,'part_urls':urls,'part_attempt':1,
+                         'signed_headers':{},'expected_length':size,
+                         'expires_at':obj.expires_at}, status=201)
     def retrieve(self, request, pk=None):
         try: obj=UploadSession.objects.get(pk=pk)
         except UploadSession.DoesNotExist: return Response({'detail':'not found'},status=404)
@@ -512,6 +598,10 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='parts/presign')
     def presign_parts(self, request, pk=None):
         obj=get_object_or_404(UploadSession, pk=pk)
+        if obj.expires_at <= timezone.now():
+            return Response({'code':'UPLOAD_SESSION_EXPIRED','detail':'upload session expired'}, status=409)
+        if obj.state == 'cancelled':
+            return Response({'code':'UPLOAD_SESSION_CANCELLED','detail':'upload session cancelled'}, status=409)
         if obj.state in ('uploaded','verified'): return Response({'parts':[]})
         numbers=request.data.get('part_numbers') or []
         if len(numbers)>20: return Response({'detail':'at most 20 parts per request'},status=400)
@@ -521,6 +611,31 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
         client=s3_presign(); ttl=int(os.getenv('PRESIGN_TTL','900'))
         parts=[{'part_number':n,'url':client.generate_presigned_url('upload_part',Params={'Bucket':obj.bucket,'Key':obj.object_key,'UploadId':obj.upload_id,'PartNumber':n},ExpiresIn=ttl),'expires_in':ttl} for n in numbers]
         return Response({'parts':parts})
+    @action(detail=True, methods=['get'], url_path='parts')
+    def list_parts(self, request, pk=None):
+        """Return server-side multipart receipts for resumable uploads."""
+        obj = get_object_or_404(UploadSession, pk=pk)
+        if obj.state in ('uploaded','verified'):
+            return Response({'parts': [], 'complete': True, 'missing_parts': []})
+        if not obj.upload_id:
+            return Response({'parts': [], 'complete': False, 'missing_parts': list(range(1, obj.total_chunks + 1))})
+        try:
+            control = s3_control(); remote, marker, seen_markers = [], None, set()
+            while True:
+                params = {'Bucket': obj.bucket, 'Key': obj.object_key, 'UploadId': obj.upload_id}
+                if marker: params['PartNumberMarker'] = marker
+                page = control.list_parts(**params)
+                remote.extend({'part_number': int(p['PartNumber']), 'etag': str(p['ETag']).strip('"'), 'size': int(p.get('Size') or 0)} for p in page.get('Parts', []))
+                if not page.get('IsTruncated'): break
+                marker = str(page.get('NextPartNumberMarker') or '')
+                if not marker or marker in seen_markers:
+                    raise ValueError('STORAGE_RECONCILIATION_FAILED')
+                seen_markers.add(marker)
+            present = {p['part_number'] for p in remote}
+            return Response({'parts': remote, 'complete': len(present) == obj.total_chunks,
+                             'missing_parts': [n for n in range(1, obj.total_chunks + 1) if n not in present]})
+        except Exception as exc:
+            return Response({'code':'STORAGE_RECONCILIATION_FAILED','detail':str(exc)}, status=409)
     @action(detail=True, methods=['post'], url_path='complete')
     def complete(self, request, pk=None):
         try: obj=UploadSession.objects.get(pk=pk)
@@ -687,15 +802,26 @@ def bom_revision_actions(request, pk=None):
     if str(obj.bom.bom_type).upper() != 'EBOM':
         return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM is supported'}, status=422)
     action = str(request.data.get('action') or '').lower()
-    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
+    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','release':'released','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
+    action_states = {'submit': 'draft', 'approve': 'pending_review', 'reject': 'pending_review',
+                     'publish': 'approved', 'release': 'release_pending', 'retry_publish': 'release_failed',
+                     'abandon_publish': 'release_failed', 'retire': 'released', 'withdraw': 'pending_review',
+                     'revise': 'rejected'}
     target = action_map.get(action, str(request.data.get('state') or '').lower())
     role = user_role(request.user)
-    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'approved','release_pending','released','release_failed','obsolete'}}
-    if role != 'admin' and target not in role_targets.get(role, set()):
+    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'release_pending','released','release_failed','obsolete'}}
+    abandoning = obj.revision_state == 'release_failed' and target == 'approved'
+    if abandoning and role not in ('publisher', 'admin'):
+        return Response({'code':'PERMISSION_DENIED','detail':'only a publisher may abandon a failed publication'}, status=403)
+    if not abandoning and role != 'admin' and target not in role_targets.get(role, set()):
         return Response({'detail':'this transition is not permitted for your role'}, status=403)
     expected = request.headers.get('If-Match')
-    if expected and str(obj.row_version) != expected.strip('"'):
-        return Response({'code':'CONCURRENT_MODIFICATION','current_row_version':obj.row_version}, status=409)
+    if not expected:
+        return Response({'code':'PRECONDITION_REQUIRED','detail':'If-Match header is required'}, status=428)
+    if str(obj.row_version) != expected.strip('"'):
+        return Response({'code':'CONCURRENT_MODIFICATION','current_row_version':obj.row_version}, status=412)
+    if action and (action not in action_states or obj.revision_state != action_states[action]):
+        return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':action}, status=409)
     allowed = {'draft': {'pending_review'}, 'pending_review': {'approved','rejected','draft'}, 'rejected': {'draft'}, 'approved': {'release_pending'}, 'release_pending': {'released','release_failed'}, 'release_failed': {'release_pending','approved'}, 'released': {'obsolete'}, 'obsolete': set()}
     if target not in allowed.get(obj.revision_state, set()):
         return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
@@ -706,12 +832,17 @@ def bom_revision_actions(request, pk=None):
             return Response({'code':'SOD_VIOLATION','detail':'only the submitter may withdraw a pending BOM revision'}, status=409)
         if not str(request.data.get('reason') or '').strip():
             return Response({'code':'WITHDRAW_REASON_REQUIRED','detail':'reason is required'}, status=422)
-    if target in ('approved','rejected') and obj.submitter_id == request.user.id:
+    if target in ('approved','rejected') and not abandoning and obj.submitter_id == request.user.id:
         return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own BOM revision'}, status=409)
-    if target == 'released' and (obj.submitter_id == request.user.id or obj.reviewer_id == request.user.id):
+    if (target in ('release_pending','released') or abandoning) and (obj.submitter_id == request.user.id or obj.reviewer_id == request.user.id):
         return Response({'code':'SOD_VIOLATION','detail':'submitter or reviewer cannot publish own BOM revision'}, status=409)
-    if target == 'released' and obj.items.filter(child_part_revision__revision_state__in=['draft','pending_review','approved','release_failed','obsolete']).exists():
-        return Response({'code':'REFERENCED_REVISION_NOT_RELEASED','detail':'all BOM child revisions must be released'}, status=409)
+    if target in ('pending_review', 'release_pending', 'released'):
+        # Recheck persisted rows at each gate: referenced revisions and units
+        # can change after a row was originally added to a draft.
+        try:
+            validate_bom_tree(obj, lifecycle_gate=True)
+        except BOMValidationError as exc:
+            return Response(exc.detail, status=exc.status_code)
     if target == 'released':
         revisions = [obj.root_part_revision] + list(
             PartRevision.objects.filter(bomitem__bom_revision=obj).distinct()
@@ -721,12 +852,12 @@ def bom_revision_actions(request, pk=None):
             if gate_error:
                 gate_error['detail'] = 'all BOM attachments must have a clean scan or approved opaque-encryption disposition'
                 return Response(gate_error, status=409)
-    if target == 'approved': obj.reviewer = request.user
+    if target == 'approved' and not abandoning: obj.reviewer = request.user
     if target in ('release_pending','released','obsolete'): obj.publisher = request.user
     if target == 'pending_review': obj.submitter = request.user
     obj.revision_state = target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','reviewer','publisher','submitter'])
     record_audit(request, 'bom.revision.transition', obj, state=target, reason=request.data.get('reason',''))
-    return Response(BOMRevisionSerializer(obj).data)
+    return Response(BOMRevisionSerializer(obj, context={'request': request}).data, headers={'ETag': f'"{obj.row_version}"'})
 
 
 @api_view(['POST'])

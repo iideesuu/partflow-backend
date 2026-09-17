@@ -1,24 +1,52 @@
 param([switch]$Check, [switch]$Sync)
 
-# Local source is authoritative. No arguments (or -Check) only checks drift;
-# -Sync exports readable source to container templates and never writes source.
+# Source is authoritative; no arguments means a read-only check.
+# Only -Sync exports source. Never copy ciphertext or skip unreadable inputs.
 $ErrorActionPreference = 'Stop'
 if ($Check -and $Sync) { throw 'Use either -Check or -Sync.' }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $templateRoot = Join-Path $repo 'runtime_templates'
 $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
-$rg = (Get-Command rg -ErrorAction Stop).Source
+$rg = (Get-Command rg -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $previousConsoleEncoding = [Console]::OutputEncoding
 $previousOutputEncoding = $OutputEncoding
 
 function ConvertTo-TemplateText([string]$text) {
     if ($text.Contains([char]0) -or $text.Contains('%TSD-Header-###%')) {
-        throw 'Unreadable encrypted or binary content; no template was exported.'
+        throw 'Encrypted or binary content was returned instead of plaintext.'
     }
-    $text = $text.TrimStart([char]0xFEFF).Replace("`r`n", "`n").Replace("`r", "`n")
-    # rg returns lines. A final newline is canonical for non-empty templates.
-    if ($text.Length -and -not $text.EndsWith("`n")) { $text += "`n" }
+    $text = $text.TrimStart([char]0xFEFF).Replace([string][char]13 + [char]10, [string][char]10).Replace([string][char]13, [string][char]10)
+    if ($text.Length -and -not $text.EndsWith([string][char]10)) { $text += [char]10 }
     return $text
+}
+
+function Read-ContainerTemplate([string]$path) {
+    # Docker copies raw bytes; an authorized rg read could hide ciphertext.
+    # Strict UTF-8 plus header/NUL validation must succeed without decryption.
+    return ConvertTo-TemplateText ($utf8.GetString([IO.File]::ReadAllBytes($path)))
+}
+
+function Read-Plaintext([string]$path) {
+    # rg is the authorized transparent-encryption reader. JSON preserves blank
+    # lines and distinguishes invalid UTF-8 (base64 bytes) from readable text.
+    $records = @(& $rg --no-config --json --text --no-mmap --color never '^' -- $path)
+    $readerExit = $LASTEXITCODE
+    if ($readerExit -notin @(0, 1)) { throw "Plaintext reader failed (exit $readerExit)." }
+    if ($readerExit -eq 1) {
+        if ((Get-Item -LiteralPath $path).Length -ne 0) { throw 'Non-empty file returned no readable text.' }
+        return ''
+    }
+    $builder = New-Object System.Text.StringBuilder
+    $matches = 0
+    foreach ($record in $records) {
+        $item = $record | ConvertFrom-Json
+        if ($item.type -ne 'match') { continue }
+        if ($null -eq $item.data.lines.text) { throw 'Plaintext is not valid UTF-8.' }
+        [void]$builder.Append([string]$item.data.lines.text)
+        $matches += 1
+    }
+    if (-not $matches) { throw 'Plaintext reader returned no match records.' }
+    return ConvertTo-TemplateText $builder.ToString()
 }
 
 try {
@@ -31,69 +59,107 @@ try {
             $paths[$relative.Substring(0, $relative.Length - 5)] = $true
         }
     }
-    # Include newly added PLM modules/tests/migrations before their first build.
-    Get-ChildItem -LiteralPath (Join-Path $repo 'plm') -Recurse -File -Filter '*.py' | ForEach-Object {
-        $paths[$_.FullName.Substring($repo.Length + 1)] = $true
+    # Include new application modules/tests/migrations before their first build.
+    foreach ($directory in @('plm', 'config')) {
+        $sourceRoot = Join-Path $repo $directory
+        if (Test-Path -LiteralPath $sourceRoot) {
+            Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Filter '*.py' | ForEach-Object {
+                $paths[$_.FullName.Substring($repo.Length + 1)] = $true
+            }
+        }
     }
     $pending = @()
-    $protected = @()
+    $invalid = @()
     foreach ($relative in ($paths.Keys | Sort-Object)) {
-        $source = Join-Path $repo $relative
-        $template = Join-Path $templateRoot ($relative + '.tmpl')
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing local source: $relative" }
-        $rawHead = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($source)[0..([Math]::Min(63, (Get-Item -LiteralPath $source).Length - 1))])
-        if ($rawHead.Contains('%TSD-Header-###%') -and (Test-Path -LiteralPath $template -PathType Leaf) -and -not $Sync) {
-            $protected += $relative
-            continue
-        }
-        # This reader sees authorized plaintext under enterprise encryption.
-        # Copy-Item/Get-FileHash would operate on ciphertext instead.
-        $lines = @(& $rg --text --no-heading --no-line-number --no-filename '^' -- $source)
-        $readerExit = $LASTEXITCODE
-        if (($lines -join "`n").Contains('%TSD-Header-###%') -and (Test-Path -LiteralPath $template -PathType Leaf) -and -not $Sync) {
-            $protected += $relative
-            continue
-        }
-        if ($readerExit -gt 1) {
-            # Enterprise transparent-encryption ACLs may deny plaintext reads
-            # from this shell. Keep the reviewed template as the container
-            # authority and report the protected path instead of aborting the
-            # entire check. A missing template remains a hard failure.
-            if ((Test-Path -LiteralPath $template -PathType Leaf) -and -not $Sync) {
-                $protected += $relative
-                continue
+        try {
+            $source = Join-Path $repo $relative
+            $template = Join-Path $templateRoot ($relative + '.tmpl')
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'Missing local source.' }
+            $text = Read-Plaintext $source
+            $exists = Test-Path -LiteralPath $template -PathType Leaf
+            $existing = if ($exists) { Read-ContainerTemplate $template } else { $null }
+            if (-not $exists -or $existing -cne $text) {
+                $pending += [pscustomobject]@{
+                    Relative = $relative; Source = $source; Path = $template
+                    Text = $text; Existing = $existing; Existed = $exists
+                    Stage = $null; Backup = $null; Committed = $false
+                }
             }
-            throw "Source reader failed ($readerExit): $relative"
-        }
-        if ($readerExit -eq 1 -and (Get-Item -LiteralPath $source).Length -ne 0) {
-            throw "Source reader returned no readable text: $relative"
-        }
-        $text = ConvertTo-TemplateText ($lines -join "`n")
-        if ($lines.Count -and -not $text.EndsWith("`n")) { $text += "`n" }
-        $existing = $null
-        if (Test-Path -LiteralPath $template -PathType Leaf) {
-            try { $existing = ConvertTo-TemplateText ([IO.File]::ReadAllText($template, $utf8)) }
-            catch { if (-not $Sync) { throw "Unreadable runtime template: $relative.tmpl" } }
-        }
-        if ($null -eq $existing -or $existing -cne $text) {
-            $pending += [pscustomobject]@{ Relative = $relative; Path = $template; Text = $text }
+        } catch {
+            # Report failed paths, never protected file contents.
+            $invalid += "$relative : $($_.Exception.Message)"
         }
     }
-    # Read/validate every source before writing anything; output is UTF-8, no BOM.
-    if ($Sync) {
+    if ($invalid.Count) {
+        $message = "Plaintext validation failed; no templates written:" + [char]10 + ($invalid -join [char]10)
+        if ($pending.Count) { $message += [char]10 + "Readable files with drift:" + [char]10 + (($pending | ForEach-Object { $_.Relative }) -join [char]10) }
+        throw $message
+    }
+    if (-not $Sync) {
+        if ($pending.Count) { throw ("runtime_templates drift detected (read-only check):" + [char]10 + (($pending | ForEach-Object { $_.Relative }) -join [char]10)) }
+        Write-Output ("runtime_templates match {0} readable source files." -f $paths.Count)
+        return
+    }
+
+    # Validate all inputs before staging. Each same-volume replacement is
+    # atomic; retain originals until the batch succeeds for rollback on error.
+    $createdDirectories = New-Object 'System.Collections.Generic.List[string]'
+    $rollbackErrors = @()
+    try {
         foreach ($entry in $pending) {
             $directory = Split-Path -Parent $entry.Path
-            if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
-            [IO.File]::WriteAllText($entry.Path, $entry.Text, $utf8)
+            $missing = @()
+            $cursor = $directory
+            while (-not (Test-Path -LiteralPath $cursor -PathType Container)) {
+                $missing += $cursor
+                $cursor = Split-Path -Parent $cursor
+            }
+            for ($i = $missing.Count - 1; $i -ge 0; $i--) {
+                [void][IO.Directory]::CreateDirectory($missing[$i])
+                $createdDirectories.Add($missing[$i])
+            }
+            $entry.Stage = Join-Path $directory ('.sync-' + [guid]::NewGuid().ToString('N') + '.tmp')
+            $entry.Backup = Join-Path $directory ('.sync-' + [guid]::NewGuid().ToString('N') + '.bak')
+            [IO.File]::WriteAllText($entry.Stage, $entry.Text, $utf8)
+            if ((Read-ContainerTemplate $entry.Stage) -cne $entry.Text) { throw "Staged plaintext mismatch: $($entry.Relative)" }
         }
-        Write-Output ("Exported {0} local source files to runtime_templates; checked {1}." -f $pending.Count, $paths.Count)
-    } elseif ($pending.Count) {
-        Write-Error ("runtime_templates drift detected; run -Sync before deployment:`n" + (($pending | ForEach-Object { $_.Relative }) -join "`n"))
-        exit 1
-    } else {
-        Write-Output ("runtime_templates match {0} local source files." -f ($paths.Count - $protected.Count))
-        if ($protected.Count) { Write-Output ("Protected encrypted sources kept from plaintext comparison: " + ($protected -join ', ')) }
+        # Refuse to overwrite a source/template changed during validation.
+        foreach ($entry in $pending) {
+            if ((Read-Plaintext $entry.Source) -cne $entry.Text) { throw "Source changed during sync: $($entry.Relative)" }
+            $exists = Test-Path -LiteralPath $entry.Path -PathType Leaf
+            if ($exists -ne $entry.Existed) { throw "Template changed during sync: $($entry.Relative)" }
+            if ($exists -and (Read-ContainerTemplate $entry.Path) -cne $entry.Existing) { throw "Template changed during sync: $($entry.Relative)" }
+        }
+        foreach ($entry in $pending) {
+            if ($entry.Existed) { [IO.File]::Replace($entry.Stage, $entry.Path, $entry.Backup) }
+            else { [IO.File]::Move($entry.Stage, $entry.Path) }
+            $entry.Committed = $true
+        }
+    } catch {
+        $failure = $_
+        for ($i = $pending.Count - 1; $i -ge 0; $i--) {
+            $entry = $pending[$i]
+            if (-not $entry.Committed) { continue }
+            try {
+                if ($entry.Existed) { [IO.File]::Replace($entry.Backup, $entry.Path, $entry.Stage) }
+                else { [IO.File]::Delete($entry.Path) }
+                $entry.Committed = $false
+            } catch { $rollbackErrors += "$($entry.Relative) (backup: $($entry.Backup))" }
+        }
+        if ($rollbackErrors.Count) { throw ("Sync failed; manual rollback needed for:" + [char]10 + ($rollbackErrors -join [char]10)) }
+        throw $failure
+    } finally {
+        foreach ($entry in $pending) {
+            if ($entry.Stage -and (Test-Path -LiteralPath $entry.Stage)) { [IO.File]::Delete($entry.Stage) }
+            # Preserve backups if rollback itself failed.
+            if ($entry.Backup -and (Test-Path -LiteralPath $entry.Backup) -and -not $rollbackErrors.Count) { [IO.File]::Delete($entry.Backup) }
+        }
+        for ($i = $createdDirectories.Count - 1; $i -ge 0; $i--) {
+            $directory = $createdDirectories[$i]
+            if ((Test-Path -LiteralPath $directory) -and -not @(Get-ChildItem -LiteralPath $directory -Force).Count) { [IO.Directory]::Delete($directory) }
+        }
     }
+    Write-Output ("Exported {0} source files to runtime_templates; checked {1}." -f $pending.Count, $paths.Count)
 } finally {
     [Console]::OutputEncoding = $previousConsoleEncoding
     $OutputEncoding = $previousOutputEncoding

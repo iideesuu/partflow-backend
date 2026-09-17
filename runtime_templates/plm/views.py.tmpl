@@ -19,7 +19,7 @@ from .models import *
 from .serializers import *
 from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url
 from .roles import RolePermission, user_role
-from .bom_services import validate_bom_tree
+from .bom_services import BOMValidationError, validate_bom_tree
 
 def record_audit(request, action, obj=None, **details):
     return AuditEvent.objects.create(actor=request.user.username, action=action,
@@ -278,7 +278,7 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         if str(bom.bom_type).upper() != 'EBOM':
             return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM revisions are supported'}, status=422)
         if request.method == 'GET':
-            return Response(BOMRevisionSerializer(bom.revisions.select_related('root_part_revision__part').prefetch_related('items__child_part_revision__part','items__unit'), many=True).data)
+            return Response(BOMRevisionSerializer(bom.revisions.select_related('root_part_revision__part').prefetch_related('items__child_part_revision__part','items__unit'), many=True, context={'request': request}).data)
         latest=bom.revisions.order_by('-revision').first()
         root_id=request.data.get('root_part_revision') or (str(latest.root_part_revision_id) if latest else None)
         if not root_id: raise ValidationError({'root_part_revision':'required'})
@@ -286,7 +286,7 @@ class BOMViewSet(RoleProtectedMixin, AuditWriteMixin, viewsets.ModelViewSet):
         rev=request.data.get('revision') or chr(65 + bom.revisions.count())
         obj=BOMRevision.objects.create(bom=bom,revision=rev,root_part_revision=root,revision_state='draft')
         record_audit(request,'bom.revision.create',obj)
-        return Response(BOMRevisionSerializer(obj).data,status=201)
+        return Response(BOMRevisionSerializer(obj, context={'request': request}).data,status=201)
     @action(detail=True, methods=['get','post'], url_path=r'revisions/(?P<revision_id>[^/.]+)/items')
     def revision_items(self, request, pk=None, revision_id=None):
         bom=self.get_object(); br=get_object_or_404(BOMRevision,pk=revision_id,bom=bom)
@@ -802,15 +802,26 @@ def bom_revision_actions(request, pk=None):
     if str(obj.bom.bom_type).upper() != 'EBOM':
         return Response({'code':'BOM_TYPE_NOT_SUPPORTED','detail':'only EBOM is supported'}, status=422)
     action = str(request.data.get('action') or '').lower()
-    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
+    action_map = {'submit':'pending_review','approve':'approved','reject':'rejected','publish':'release_pending','release':'released','retry_publish':'release_pending','abandon_publish':'approved','retire':'obsolete','withdraw':'draft','revise':'draft'}
+    action_states = {'submit': 'draft', 'approve': 'pending_review', 'reject': 'pending_review',
+                     'publish': 'approved', 'release': 'release_pending', 'retry_publish': 'release_failed',
+                     'abandon_publish': 'release_failed', 'retire': 'released', 'withdraw': 'pending_review',
+                     'revise': 'rejected'}
     target = action_map.get(action, str(request.data.get('state') or '').lower())
     role = user_role(request.user)
-    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'approved','release_pending','released','release_failed','obsolete'}}
-    if role != 'admin' and target not in role_targets.get(role, set()):
+    role_targets = {'engineer': {'pending_review','draft'}, 'reviewer': {'approved','rejected'}, 'publisher': {'release_pending','released','release_failed','obsolete'}}
+    abandoning = obj.revision_state == 'release_failed' and target == 'approved'
+    if abandoning and role not in ('publisher', 'admin'):
+        return Response({'code':'PERMISSION_DENIED','detail':'only a publisher may abandon a failed publication'}, status=403)
+    if not abandoning and role != 'admin' and target not in role_targets.get(role, set()):
         return Response({'detail':'this transition is not permitted for your role'}, status=403)
     expected = request.headers.get('If-Match')
-    if expected and str(obj.row_version) != expected.strip('"'):
-        return Response({'code':'CONCURRENT_MODIFICATION','current_row_version':obj.row_version}, status=409)
+    if not expected:
+        return Response({'code':'PRECONDITION_REQUIRED','detail':'If-Match header is required'}, status=428)
+    if str(obj.row_version) != expected.strip('"'):
+        return Response({'code':'CONCURRENT_MODIFICATION','current_row_version':obj.row_version}, status=412)
+    if action and (action not in action_states or obj.revision_state != action_states[action]):
+        return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':action}, status=409)
     allowed = {'draft': {'pending_review'}, 'pending_review': {'approved','rejected','draft'}, 'rejected': {'draft'}, 'approved': {'release_pending'}, 'release_pending': {'released','release_failed'}, 'release_failed': {'release_pending','approved'}, 'released': {'obsolete'}, 'obsolete': set()}
     if target not in allowed.get(obj.revision_state, set()):
         return Response({'code':'STATE_TRANSITION_INVALID','current_state':obj.revision_state,'action':target,'allowed_actions':sorted(allowed.get(obj.revision_state,set()))}, status=409)
@@ -821,12 +832,17 @@ def bom_revision_actions(request, pk=None):
             return Response({'code':'SOD_VIOLATION','detail':'only the submitter may withdraw a pending BOM revision'}, status=409)
         if not str(request.data.get('reason') or '').strip():
             return Response({'code':'WITHDRAW_REASON_REQUIRED','detail':'reason is required'}, status=422)
-    if target in ('approved','rejected') and obj.submitter_id == request.user.id:
+    if target in ('approved','rejected') and not abandoning and obj.submitter_id == request.user.id:
         return Response({'code':'SOD_VIOLATION','detail':'submitter cannot review own BOM revision'}, status=409)
-    if target == 'released' and (obj.submitter_id == request.user.id or obj.reviewer_id == request.user.id):
+    if (target in ('release_pending','released') or abandoning) and (obj.submitter_id == request.user.id or obj.reviewer_id == request.user.id):
         return Response({'code':'SOD_VIOLATION','detail':'submitter or reviewer cannot publish own BOM revision'}, status=409)
-    if target == 'released' and obj.items.filter(child_part_revision__revision_state__in=['draft','pending_review','approved','release_failed','obsolete']).exists():
-        return Response({'code':'REFERENCED_REVISION_NOT_RELEASED','detail':'all BOM child revisions must be released'}, status=409)
+    if target in ('pending_review', 'release_pending', 'released'):
+        # Recheck persisted rows at each gate: referenced revisions and units
+        # can change after a row was originally added to a draft.
+        try:
+            validate_bom_tree(obj, lifecycle_gate=True)
+        except BOMValidationError as exc:
+            return Response(exc.detail, status=exc.status_code)
     if target == 'released':
         revisions = [obj.root_part_revision] + list(
             PartRevision.objects.filter(bomitem__bom_revision=obj).distinct()
@@ -836,12 +852,12 @@ def bom_revision_actions(request, pk=None):
             if gate_error:
                 gate_error['detail'] = 'all BOM attachments must have a clean scan or approved opaque-encryption disposition'
                 return Response(gate_error, status=409)
-    if target == 'approved': obj.reviewer = request.user
+    if target == 'approved' and not abandoning: obj.reviewer = request.user
     if target in ('release_pending','released','obsolete'): obj.publisher = request.user
     if target == 'pending_review': obj.submitter = request.user
     obj.revision_state = target; obj.row_version += 1; obj.save(update_fields=['revision_state','row_version','reviewer','publisher','submitter'])
     record_audit(request, 'bom.revision.transition', obj, state=target, reason=request.data.get('reason',''))
-    return Response(BOMRevisionSerializer(obj).data)
+    return Response(BOMRevisionSerializer(obj, context={'request': request}).data, headers={'ETag': f'"{obj.row_version}"'})
 
 
 @api_view(['POST'])

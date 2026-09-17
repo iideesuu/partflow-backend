@@ -7,13 +7,12 @@ from .models import NumberRequest, NumberSource
 from .roles import require_role
 from .serializers import NumberRequestSerializer
 PART_CODE_RE = re.compile(r"^\d{4}-\d{5}$")
-
 @api_view(["GET", "POST"])
 @require_role("engineer", "admin")
 def external_number_register(request):
     if request.method == "GET":
         rows = NumberRequest.objects.select_related("source").order_by("-id")[:100]
-        return Response({"rule":"NNNN-NNNNN", "requests":NumberRequestSerializer(rows, many=True).data})
+        return Response({"rule":"NNNN-NNNNN", "sources":list(NumberSource.objects.filter(is_enabled=True).values("id","name","url")), "requests":NumberRequestSerializer(rows, many=True).data})
     payload = request.data or {}; source_id = payload.get("source_id") or payload.get("source")
     source_request_id = str(payload.get("source_request_id") or "").strip(); operation_key = str(payload.get("operation_key") or "").strip()
     part_code = str(payload.get("part_code") or payload.get("returned_part_code") or "").strip(); errors = {}
@@ -25,6 +24,9 @@ def external_number_register(request):
     try: source = NumberSource.objects.get(pk=source_id, is_enabled=True)
     except (NumberSource.DoesNotExist, ValueError): return Response({"code":"NUMBER_SOURCE_NOT_FOUND", "detail":"enabled number source not found"}, status=422)
     with transaction.atomic():
+        duplicate = NumberRequest.objects.select_for_update().filter(source=source, source_request_id=source_request_id).first()
+        if duplicate and duplicate.operation_key != operation_key:
+            return Response({"code":"NUMBER_REQUEST_DUPLICATE", "detail":"source request id has already been registered"}, status=409)
         existing = NumberRequest.objects.select_for_update().filter(operation_key=operation_key).first()
         if existing:
             if (existing.source_id, existing.source_request_id, existing.returned_part_code) != (source.pk, source_request_id, part_code):

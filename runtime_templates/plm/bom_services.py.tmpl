@@ -23,19 +23,15 @@ def _error(code, detail, field=None):
     raise error
 
 
-def validate_bom_item(*, bom_revision, child_part_revision, quantity, unit=None,
-                      parent_item=None, position='__NO_POSITION__', instance=None):
-    if bom_revision is None:
-        _error('BOM_REVISION_REQUIRED', 'bom_revision is required', 'bom_revision')
-    if bom_revision.revision_state != 'draft':
-        _error('IMMUTABLE_REVISION', 'BOM revision is immutable outside draft state', 'bom_revision')
-    if child_part_revision is None:
-        _error('CHILD_REVISION_REQUIRED', 'child_part_revision is required', 'child_part_revision')
-    if child_part_revision.revision_state != 'released':
-        code = 'REFERENCED_REVISION_OBSOLETE' if child_part_revision.revision_state == 'obsolete' else 'REFERENCED_REVISION_NOT_RELEASED'
-        _error(code, 'child revision must be released', 'child_part_revision')
-    if parent_item is not None and parent_item.bom_revision_id != bom_revision.pk:
-        _error('PARENT_ITEM_CROSS_BOM', 'parent item belongs to another BOM revision', 'parent_item')
+def _validate_released_revision(revision, field):
+    if revision.revision_state != 'released':
+        code = 'REFERENCED_REVISION_OBSOLETE' if revision.revision_state == 'obsolete' else 'REFERENCED_REVISION_NOT_RELEASED'
+        _error(code, 'referenced revision must be released', field)
+
+
+def _validate_row_values(child_part_revision, quantity, unit, position):
+    """Checks shared by row edits and submit/publication gates."""
+    _validate_released_revision(child_part_revision, 'child_part_revision')
     try:
         qty = Decimal(str(quantity))
     except Exception:
@@ -56,6 +52,20 @@ def validate_bom_item(*, bom_revision, child_part_revision, quantity, unit=None,
         import re
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,31}', str(position)):
             _error('POSITION_FORMAT_INVALID', 'invalid reference designator', 'position')
+
+
+def validate_bom_item(*, bom_revision, child_part_revision, quantity, unit=None,
+                      parent_item=None, position='__NO_POSITION__', instance=None):
+    if bom_revision is None:
+        _error('BOM_REVISION_REQUIRED', 'bom_revision is required', 'bom_revision')
+    if bom_revision.revision_state != 'draft':
+        _error('IMMUTABLE_REVISION', 'BOM revision is immutable outside draft state', 'bom_revision')
+    if child_part_revision is None:
+        _error('CHILD_REVISION_REQUIRED', 'child_part_revision is required', 'child_part_revision')
+    if parent_item is not None and parent_item.bom_revision_id != bom_revision.pk:
+        _error('PARENT_ITEM_CROSS_BOM', 'parent item belongs to another BOM revision', 'parent_item')
+    _validate_row_values(child_part_revision, quantity, unit, position)
+    if position != '__NO_POSITION__':
         qs = bom_revision.items.filter(position=position)
         if parent_item is None:
             qs = qs.filter(parent_item__isnull=True)
@@ -91,11 +101,32 @@ def validate_bom_item(*, bom_revision, child_part_revision, quantity, unit=None,
     return True
 
 
-def validate_bom_tree(bom_revision):
-    """Run full graph checks before submit/publish; returns node count."""
+def validate_bom_tree(bom_revision, *, lifecycle_gate=False):
+    """Check graph integrity; additionally revalidate live references at gates.
+
+    Reading a historical tree remains valid after a referenced Part is retired.
+    Lifecycle gates lock referenced revisions until the outer BOM transaction
+    commits, closing the race with a simultaneous Part lifecycle change.
+    """
     rows = list(bom_revision.items.select_related('parent_item', 'child_part_revision__unit', 'unit'))
     if len(rows) > MAX_ROWS:
         _error('BOM_SIZE_LIMIT_EXCEEDED', f'BOM revision supports at most {MAX_ROWS} rows')
+    if lifecycle_gate:
+        from .models import PartRevision
+        revision_ids = {bom_revision.root_part_revision_id, *[row.child_part_revision_id for row in rows]}
+        references = {revision.pk: revision for revision in PartRevision.objects.select_for_update(of=('self',)).select_related('unit').filter(pk__in=revision_ids).order_by('pk')}
+        _validate_released_revision(references[bom_revision.root_part_revision_id], 'root_part_revision')
+        positions = set()
+        for row in rows:
+            _validate_row_values(references[row.child_part_revision_id], row.quantity, row.unit, row.position)
+            if row.position == '__NO_POSITION__':
+                if not str(row.no_position_reason or '').strip():
+                    _error('NO_POSITION_REASON_REQUIRED', 'reason is required when position is omitted', 'no_position_reason')
+            else:
+                key = (row.parent_item_id, row.position)
+                if key in positions:
+                    _error('DUPLICATE_POSITION', 'position must be unique under the same parent', 'position')
+                positions.add(key)
     by_id = {str(row.pk): row for row in rows}
     total = 0
     for row in rows:

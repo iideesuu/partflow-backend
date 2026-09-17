@@ -157,7 +157,28 @@ class BOMRevisionSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True, read_only=True)
     root_part_code = serializers.CharField(source='root_part_revision.part.part_code', read_only=True)
     root_part_revision_code = serializers.CharField(source='root_part_revision.revision', read_only=True)
-    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher']
+    allowed_actions = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
+    def _role(self):
+        req = self.context.get('request') if self.context else None
+        return user_role(getattr(req, 'user', None))
+    def get_can_edit(self, obj): return self._role() in ('engineer','admin') and obj.revision_state == 'draft'
+    def get_allowed_actions(self, obj):
+        role = self._role(); req = self.context.get('request') if self.context else None
+        uid = getattr(getattr(req, 'user', None), 'id', None)
+        if not role: return []
+        state, actions = obj.revision_state, []
+        if role in ('engineer','admin') and state == 'draft': actions.append('submit')
+        if role in ('reviewer','admin') and state == 'pending_review' and obj.submitter_id != uid: actions += ['approve','reject']
+        if role in ('engineer','admin') and state == 'pending_review' and obj.submitter_id == uid: actions.append('withdraw')
+        if role in ('engineer','admin') and state == 'rejected': actions.append('revise')
+        publish = role in ('publisher','admin') and uid not in (obj.submitter_id, obj.reviewer_id)
+        if publish and state == 'approved': actions.append('publish')
+        if publish and state == 'release_pending': actions.append('release')
+        if publish and state == 'release_failed': actions += ['retry_publish','abandon_publish']
+        if role in ('publisher','admin') and state == 'released': actions.append('retire')
+        return actions
+    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items','allowed_actions','can_edit']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher','allowed_actions','can_edit']
 class BOMSerializer(serializers.ModelSerializer):
     revisions = BOMRevisionSerializer(many=True, read_only=True)
     class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','created_at','revisions']; read_only_fields = ['id','created_at','revisions']

@@ -1,0 +1,216 @@
+docker : time="2026-09-17T14:16:49+08:00" level=warning msg="a network with name partflow_net exists but was not create
+d by compose.\nSet `external: true` to use an existing network"
+At line:2 char:119
++ ... 25;exit 1}; docker compose run --rm --no-deps --entrypoint python web ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (time="2026-09-1...isting network":String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+ Container partflow-web-run-9bc8b826f2b2 Creating
+ Container partflow-web-run-9bc8b826f2b2 Created
+Creating test database for alias 'default' ('test_partflow')...
+Found 83 test(s).
+Operations to perform:
+  Synchronize unmigrated apps: drf_spectacular, rest_framework, staticfiles
+  Apply all migrations: auth, contenttypes, plm, sessions
+Synchronizing apps without migrations:
+  Creating tables...
+    Running deferred SQL...
+Running migrations:
+  Applying contenttypes.0001_initial... OK
+  Applying contenttypes.0002_remove_content_type_name... OK
+  Applying auth.0001_initial... OK
+  Applying auth.0002_alter_permission_name_max_length... OK
+  Applying auth.0003_alter_user_email_max_length... OK
+  Applying auth.0004_alter_user_username_opts... OK
+  Applying auth.0005_alter_user_last_login_null... OK
+  Applying auth.0006_require_contenttypes_0002... OK
+  Applying auth.0007_alter_validators_add_error_messages... OK
+  Applying auth.0008_alter_user_username_max_length... OK
+  Applying auth.0009_alter_user_last_name_max_length... OK
+  Applying auth.0010_alter_group_name_max_length... OK
+  Applying auth.0011_update_proxy_permissions... OK
+  Applying auth.0012_alter_user_first_name_max_length... OK
+  Applying plm.0001_initial... OK
+  Applying plm.0002_category_aliases_category_catalog_version_and_more... OK
+  Applying plm.0003_partattachment_auditevent_parameters... OK
+  Applying plm.0004_revision_lifecycle_actors... OK
+  Applying plm.0005_alter_revision_states... OK
+  Applying plm.0006_user_security... OK
+  Applying plm.0007_bom_structure... OK
+  Applying plm.0008_finalize_job... OK
+  Applying plm.0009_attachment_scan... OK
+  Applying plm.0010_release_publication... OK
+  Applying plm.0011_attachment_encryption... OK
+  Applying plm.0012_v16_release_entities... OK
+  Applying plm.0013_rename_storage_version_id... OK
+  Applying sessions.0001_initial... OK
+System check identified no issues (0 silenced).
+test_admin_roles_dictionary (plm.test_api_contracts.APICompatibilityTests.test_admin_roles_dictionary) ... ok
+test_admin_user_detail_patch_with_if_match (plm.test_api_contracts.APICompatibilityTests.test_admin_user_detail_patch_w
+ith_if_match) ... ok
+test_attachment_version_read_contract_requires_license (plm.test_api_contracts.APICompatibilityTests.test_attachment_ve
+rsion_read_contract_requires_license) ... ok
+test_audit_events_alias_is_readable (plm.test_api_contracts.APICompatibilityTests.test_audit_events_alias_is_readable)
+... ok
+test_number_allocator_removed_contract (plm.test_api_contracts.APICompatibilityTests.test_number_allocator_removed_cont
+ract) ... ok
+test_part_revisions_top_level_requires_part (plm.test_api_contracts.APICompatibilityTests.test_part_revisions_top_level
+_requires_part) ... ok
+test_unknown_job_returns_404 (plm.test_api_contracts.APICompatibilityTests.test_unknown_job_returns_404) ... ok
+test_changed_placement_invalidates_issued_license (plm.test_attachment_content.AttachmentContentTests.test_changed_plac
+ement_invalidates_issued_license) ... ok
+test_current_does_not_download_obsolete_revision (plm.test_attachment_content.AttachmentContentTests.test_current_does_
+not_download_obsolete_revision) ... ok
+test_duplicate_nonce_denied_and_audited (plm.test_attachment_content.AttachmentContentTests.test_duplicate_nonce_denied
+_and_audited) ... ok
+test_full_content_is_pinned_and_stream_is_closed (plm.test_attachment_content.AttachmentContentTests.test_full_content_
+is_pinned_and_stream_is_closed) ... ok
+test_historical_naive_date_is_validation_error (plm.test_attachment_content.AttachmentContentTests.test_historical_naiv
+e_date_is_validation_error) ... ok
+test_invalid_download_limits_are_rejected (plm.test_attachment_content.AttachmentContentTests.test_invalid_download_lim
+its_are_rejected) ... ok
+test_invalid_http_range_is_416_without_storage_read (plm.test_attachment_content.AttachmentContentTests.test_invalid_ht
+tp_range_is_416_without_storage_read) ... ok
+test_outside_range_and_byte_ceiling_do_not_touch_storage (plm.test_attachment_content.AttachmentContentTests.test_outsi
+de_range_and_byte_ceiling_do_not_touch_storage) ... ok
+test_partial_content_obeys_license_bounds (plm.test_attachment_content.AttachmentContentTests.test_partial_content_obey
+s_license_bounds) ... ok
+test_range_parser_suffix_open_and_strict_digits (plm.test_attachment_content.AttachmentContentTests.test_range_parser_s
+uffix_open_and_strict_digits) ... ok
+test_response_close_without_iteration_releases_storage_connection (plm.test_attachment_content.AttachmentContentTests.t
+est_response_close_without_iteration_releases_storage_connection) ... ok
+test_unicode_filename_header_and_control_characters (plm.test_attachment_content.AttachmentContentTests.test_unicode_fi
+lename_header_and_control_characters) ... ok
+test_wrong_object_version_or_length_returns_no_bytes (plm.test_attachment_content.AttachmentContentTests.test_wrong_obj
+ect_version_or_length_returns_no_bytes) ... ok
+test_ambiguous_local_names_fail_closed (plm.test_auth_security.AuthSecurityTests.test_ambiguous_local_names_fail_closed
+) ... ok
+test_assign_role_preserves_unrelated_groups_and_bumps_version (plm.test_auth_security.AuthSecurityTests.test_assign_rol
+e_preserves_unrelated_groups_and_bumps_version) ... ok
+test_directory_jit_and_repeat_login_remain_ldap_only (plm.test_auth_security.AuthSecurityTests.test_directory_jit_and_r
+epeat_login_remain_ldap_only) ... ok
+test_disabled_local_admin_does_not_fallback_to_ldap (plm.test_auth_security.AuthSecurityTests.test_disabled_local_admin
+_does_not_fallback_to_ldap) ... ok
+test_five_invalid_logins_are_locked_and_return_retry_after (plm.test_auth_security.AuthSecurityTests.test_five_invalid_
+logins_are_locked_and_return_retry_after) ... ok
+test_ldap_failure_never_falls_back_to_local (plm.test_auth_security.AuthSecurityTests.test_ldap_failure_never_falls_bac
+k_to_local) ... ok
+test_ldap_shadow_cannot_take_over_local_superuser (plm.test_auth_security.AuthSecurityTests.test_ldap_shadow_cannot_tak
+e_over_local_superuser) ... ok
+test_local_admin_csrf_login_session_and_logout (plm.test_auth_security.AuthSecurityTests.test_local_admin_csrf_login_se
+ssion_and_logout) ... ok
+test_local_lockout_still_applies_in_mixed_mode (plm.test_auth_security.AuthSecurityTests.test_local_lockout_still_appli
+es_in_mixed_mode) ... ok
+test_local_password_failure_does_not_fallback_to_ldap (plm.test_auth_security.AuthSecurityTests.test_local_password_fai
+lure_does_not_fallback_to_ldap) ... ok
+test_local_superuser_uses_django_password_when_ldap_enabled (plm.test_auth_security.AuthSecurityTests.test_local_superu
+ser_uses_django_password_when_ldap_enabled) ... ok
+test_session_is_invalid_after_permission_version_revoke (plm.test_auth_security.AuthSecurityTests.test_session_is_inval
+id_after_permission_version_revoke) ... ok
+test_shadow_user_never_reactivates_local_disabled_account (plm.test_auth_security.AuthSecurityTests.test_shadow_user_ne
+ver_reactivates_local_disabled_account) ... ok
+test_sysadmin_can_open_workbench_and_bom_read_views (plm.test_auth_security.AuthSecurityTests.test_sysadmin_can_open_wo
+rkbench_and_bom_read_views)
+The system administrator manages PLM configuration and can inspect ... ok
+test_sysadmin_can_read_bom_revision_and_tree_endpoints (plm.test_auth_security.AuthSecurityTests.test_sysadmin_can_read
+_bom_revision_and_tree_endpoints) ... ok
+test_sysadmin_cannot_write_bom (plm.test_auth_security.AuthSecurityTests.test_sysadmin_cannot_write_bom)
+sysadmin is a configuration/read role; BOM business writes remain engineer/admin only. ... ok
+test_sysadmin_cannot_write_business_parts (plm.test_auth_security.AuthSecurityTests.test_sysadmin_cannot_write_business
+_parts) ... ok
+test_canonical_crud_tree_and_etag (plm.test_bom_structure.BOMStructureTests.test_canonical_crud_tree_and_etag) ... ok
+test_cross_revision_parent_cycle_and_unit_dimension (plm.test_bom_structure.BOMStructureTests.test_cross_revision_paren
+t_cycle_and_unit_dimension) ... ok
+test_depth_budget_does_not_write_the_sixteenth_level (plm.test_bom_structure.BOMStructureTests.test_depth_budget_does_n
+ot_write_the_sixteenth_level) ... ok
+test_legacy_nested_write_route_is_disabled (plm.test_bom_structure.BOMStructureTests.test_legacy_nested_write_route_is_
+disabled)
+Writes must use the locked canonical endpoint with If-Match. ... ok
+test_no_position_requires_reason (plm.test_bom_structure.BOMStructureTests.test_no_position_requires_reason) ... ok
+test_position_uniqueness_is_per_parent_and_invalid_quantity_is_atomic (plm.test_bom_structure.BOMStructureTests.test_po
+sition_uniqueness_is_per_parent_and_invalid_quantity_is_atomic) ... ok
+test_released_revision_and_unreleased_child_are_rejected (plm.test_bom_structure.BOMStructureTests.test_released_revisi
+on_and_unreleased_child_are_rejected) ... ok
+test_abandon_requires_publisher_preserves_reviewer_and_enforces_sod (plm.test_bom_workflow.BOMWorkflowTests.test_abando
+n_requires_publisher_preserves_reviewer_and_enforces_sod) ... ok
+test_all_gates_revalidate_every_unreleased_child_state (plm.test_bom_workflow.BOMWorkflowTests.test_all_gates_revalidat
+e_every_unreleased_child_state) ... ok
+test_full_workflow_uses_advertised_canonical_release_action (plm.test_bom_workflow.BOMWorkflowTests.test_full_workflow_
+uses_advertised_canonical_release_action) ... ok
+test_gates_revalidate_root_and_historical_tree_remains_readable (plm.test_bom_workflow.BOMWorkflowTests.test_gates_reva
+lidate_root_and_historical_tree_remains_readable) ... ok
+test_missing_stale_and_replayed_versions_are_zero_write (plm.test_bom_workflow.BOMWorkflowTests.test_missing_stale_and_
+replayed_versions_are_zero_write) ... ok
+test_reject_requires_reason_and_revise_is_not_withdraw (plm.test_bom_workflow.BOMWorkflowTests.test_reject_requires_rea
+son_and_revise_is_not_withdraw) ... ok
+test_review_withdrawal_and_publish_separation_of_duties (plm.test_bom_workflow.BOMWorkflowTests.test_review_withdrawal_
+and_publish_separation_of_duties) ... ok
+test_submit_and_release_recheck_stored_cycle_unit_and_quantity (plm.test_bom_workflow.BOMWorkflowTests.test_submit_and_
+release_recheck_stored_cycle_unit_and_quantity) ... ok
+test_submit_rechecks_duplicate_reference_designators (plm.test_bom_workflow.BOMWorkflowTests.test_submit_rechecks_dupli
+cate_reference_designators) ... ok
+test_workspace_metadata_and_actual_draft_write_permissions_match (plm.test_bom_workflow.BOMWorkflowTests.test_workspace
+_metadata_and_actual_draft_write_permissions_match) ... ok
+test_disable_does_not_assign_payload_role (plm.test_local_user_management.LocalUserManagementTests.test_disable_does_no
+t_assign_payload_role) ... ok
+test_no_role_business_api_has_explicit_code (plm.test_local_user_management.LocalUserManagementTests.test_no_role_busin
+ess_api_has_explicit_code) ... ok
+test_revoke_and_reassign (plm.test_local_user_management.LocalUserManagementTests.test_revoke_and_reassign) ... ok
+test_sysadmin_cannot_escalate_or_modify_superuser (plm.test_local_user_management.LocalUserManagementTests.test_sysadmi
+n_cannot_escalate_or_modify_superuser) ... ok
+test_register_is_idempotent (plm.test_number_register.ExternalNumberRegisterTests.test_register_is_idempotent) ... ok
+test_replay_with_different_evidence_conflicts (plm.test_number_register.ExternalNumberRegisterTests.test_replay_with_di
+fferent_evidence_conflicts) ... ok
+test_source_request_id_cannot_be_reused (plm.test_number_register.ExternalNumberRegisterTests.test_source_request_id_ca
+nnot_be_reused) ... ok
+test_create_returns_total_chunks_and_at_most_twenty_urls (plm.test_upload_protocol.UploadProtocolTests.test_create_retu
+rns_total_chunks_and_at_most_twenty_urls) ... ok
+test_list_parts_missing_next_marker_is_conflict (plm.test_upload_protocol.UploadProtocolTests.test_list_parts_missing_n
+ext_marker_is_conflict) ... ok
+test_list_parts_reconciles_all_pages (plm.test_upload_protocol.UploadProtocolTests.test_list_parts_reconciles_all_pages
+) ... ok
+test_list_parts_repeated_marker_is_conflict (plm.test_upload_protocol.UploadProtocolTests.test_list_parts_repeated_mark
+er_is_conflict) ... ok
+test_list_parts_reports_missing_parts (plm.test_upload_protocol.UploadProtocolTests.test_list_parts_reports_missing_par
+ts) ... ok
+test_presign_rejects_cancelled_session (plm.test_upload_protocol.UploadProtocolTests.test_presign_rejects_cancelled_ses
+sion) ... ok
+test_presign_rejects_expired_session (plm.test_upload_protocol.UploadProtocolTests.test_presign_rejects_expired_session
+) ... ok
+test_advanced_filters_and_where_used_contract (plm.tests.RevisionAPIContractTests.test_advanced_filters_and_where_used_
+contract) ... ok
+test_attachment_writes_are_draft_only_and_scoped_to_part (plm.tests.RevisionAPIContractTests.test_attachment_writes_are
+_draft_only_and_scoped_to_part) ... ok
+test_audit_failure_rolls_back_created_revision (plm.tests.RevisionAPIContractTests.test_audit_failure_rolls_back_create
+d_revision) ... ok
+test_audit_failure_rolls_back_transition_and_part_status (plm.tests.RevisionAPIContractTests.test_audit_failure_rolls_b
+ack_transition_and_part_status) ... ok
+test_conflict_does_not_change_revision_or_audit (plm.tests.RevisionAPIContractTests.test_conflict_does_not_change_revis
+ion_or_audit) ... ok
+test_creation_returns_identity_and_copies_only_missing_fields (plm.tests.RevisionAPIContractTests.test_creation_returns
+_identity_and_copies_only_missing_fields) ... ok
+test_master_state_cannot_bypass_revision_workflow (plm.tests.RevisionAPIContractTests.test_master_state_cannot_bypass_r
+evision_workflow) ... ok
+test_plain_attachment_scan_marks_available (plm.tests.RevisionAPIContractTests.test_plain_attachment_scan_marks_availab
+le) ... ok
+test_release_barrier_requires_clean_scan_and_publication_is_idempotent (plm.tests.RevisionAPIContractTests.test_release
+_barrier_requires_clean_scan_and_publication_is_idempotent) ... ok
+test_revision_identity_is_immutable_and_duplicate_is_validation_error (plm.tests.RevisionAPIContractTests.test_revision
+_identity_is_immutable_and_duplicate_is_validation_error) ... ok
+test_revision_serializer_exposes_teamcenter_style_allowed_actions (plm.tests.RevisionAPIContractTests.test_revision_ser
+ializer_exposes_teamcenter_style_allowed_actions) ... ok
+test_role_workflow_and_released_history_protection (plm.tests.RevisionAPIContractTests.test_role_workflow_and_released_
+history_protection) ... ok
+test_submitter_cannot_review_or_publish_and_can_withdraw_with_reason (plm.tests.RevisionAPIContractTests.test_submitter
+_cannot_review_or_publish_and_can_withdraw_with_reason) ... ok
+test_transparent_encryption_remains_downloadable_and_publishable (plm.tests.RevisionAPIContractTests.test_transparent_e
+ncryption_remains_downloadable_and_publishable) ... ok
+test_transparent_encryption_short_circuits_clamav (plm.tests.RevisionAPIContractTests.test_transparent_encryption_short
+_circuits_clamav) ... ok
+
+----------------------------------------------------------------------
+Ran 83 tests in 14.774s
+
+OK
+Destroying test database for alias 'default' ('test_partflow')...

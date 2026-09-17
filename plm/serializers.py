@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from .models import *
+from .roles import user_role
 class CategorySerializer(serializers.ModelSerializer):
     code = serializers.ReadOnlyField()
     class Meta:
@@ -18,18 +19,80 @@ class PartRevisionSerializer(serializers.ModelSerializer):
     attachment_count = serializers.IntegerField(source='attachments.count', read_only=True)
     publication_status = serializers.SerializerMethodField()
     publication_id = serializers.SerializerMethodField()
+    allowed_actions = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
     def get_publication_status(self, obj):
         publication = getattr(obj, 'release_publication', None)
         return publication.status if publication else None
     def get_publication_id(self, obj):
         publication = getattr(obj, 'release_publication', None)
         return str(publication.pk) if publication else None
+    def _request_role(self):
+        request = self.context.get('request') if self.context else None
+        user = getattr(request, 'user', None)
+        return user_role(user)
+    def get_can_edit(self, obj):
+        """Whether the current principal may edit this revision in-place.
+
+        Teamcenter-style clients use this hint to disable fields before the
+        PATCH request.  The server remains authoritative and still enforces
+        the same draft/role checks on write.
+        """
+        role = self._request_role()
+        return role in ('engineer', 'admin') and obj.revision_state == 'draft'
+    def get_allowed_actions(self, obj):
+        """Return canonical workflow actions available to this principal.
+
+        The list mirrors ``PartRevisionViewSet.transition`` including
+        separation-of-duty checks, so a client can render the same action bar
+        without probing each endpoint.  Missing request context intentionally
+        yields an empty list rather than granting access.
+        """
+        role = self._request_role()
+        if not role:
+            return []
+        state = obj.revision_state
+        actions = []
+        if role in ('engineer', 'admin') and state == 'draft':
+            actions.append('submit')
+        if role in ('reviewer', 'admin') and state == 'pending_review':
+            # Submitter cannot review their own revision (SoD-1).
+            request = self.context.get('request') if self.context else None
+            if not request or obj.submitter_id != getattr(request.user, 'id', None):
+                actions.extend(('approve', 'reject'))
+        if role in ('engineer', 'admin') and state == 'pending_review':
+            request = self.context.get('request') if self.context else None
+            if request and obj.submitter_id == getattr(request.user, 'id', None):
+                actions.append('withdraw')
+        if role in ('engineer', 'admin') and state == 'rejected':
+            actions.append('revise')
+        if role in ('publisher', 'admin') and state == 'approved':
+            if self._can_publish(obj):
+                actions.append('publish')
+        if role in ('publisher', 'admin') and state == 'release_pending':
+            if self._can_publish(obj):
+                # ``publish`` targets release_pending and is therefore not a
+                # valid action while already pending; only completion applies.
+                actions.append('release')
+        if role in ('publisher', 'admin') and state == 'release_failed':
+            if self._can_publish(obj):
+                actions.extend(('retry_publish', 'abandon_publish'))
+        if role in ('publisher', 'admin') and state == 'released':
+            actions.append('retire')
+        return actions
+    def _can_publish(self, obj):
+        request = self.context.get('request') if self.context else None
+        if not request:
+            return False
+        uid = getattr(request.user, 'id', None)
+        # Submitter/reviewer may not publish the same revision (SoD-2).
+        return uid not in (obj.submitter_id, obj.reviewer_id)
     def validate_parameters(self, value):
         if not isinstance(value, dict): raise serializers.ValidationError('parameters must be a key/value object')
         return value
     class Meta:
         model = PartRevision
-        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','created_at']
+        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','allowed_actions','can_edit','created_at']
         read_only_fields = ['id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
         extra_kwargs = {'name': {'required': False}, 'revision': {'required': False}}
 class PartSerializer(serializers.ModelSerializer):
@@ -94,7 +157,28 @@ class BOMRevisionSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True, read_only=True)
     root_part_code = serializers.CharField(source='root_part_revision.part.part_code', read_only=True)
     root_part_revision_code = serializers.CharField(source='root_part_revision.revision', read_only=True)
-    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher']
+    allowed_actions = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
+    def _role(self):
+        req = self.context.get('request') if self.context else None
+        return user_role(getattr(req, 'user', None))
+    def get_can_edit(self, obj): return self._role() in ('engineer','admin') and obj.revision_state == 'draft'
+    def get_allowed_actions(self, obj):
+        role = self._role(); req = self.context.get('request') if self.context else None
+        uid = getattr(getattr(req, 'user', None), 'id', None)
+        if not role: return []
+        state, actions = obj.revision_state, []
+        if role in ('engineer','admin') and state == 'draft': actions.append('submit')
+        if role in ('reviewer','admin') and state == 'pending_review' and obj.submitter_id != uid: actions += ['approve','reject']
+        if role in ('engineer','admin') and state == 'pending_review' and obj.submitter_id == uid: actions.append('withdraw')
+        if role in ('engineer','admin') and state == 'rejected': actions.append('revise')
+        publish = role in ('publisher','admin') and uid not in (obj.submitter_id, obj.reviewer_id)
+        if publish and state == 'approved': actions.append('publish')
+        if publish and state == 'release_pending': actions.append('release')
+        if publish and state == 'release_failed': actions += ['retry_publish','abandon_publish']
+        if role in ('publisher','admin') and state == 'released': actions.append('retire')
+        return actions
+    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items','allowed_actions','can_edit']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher','allowed_actions','can_edit']
 class BOMSerializer(serializers.ModelSerializer):
     revisions = BOMRevisionSerializer(many=True, read_only=True)
     class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','created_at','revisions']; read_only_fields = ['id','created_at','revisions']
