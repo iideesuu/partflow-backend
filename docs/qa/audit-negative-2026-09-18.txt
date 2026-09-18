@@ -1,0 +1,41 @@
+﻿# Dynamic backend negative audit — 2026-09-18
+
+Environment: `docker compose -f partflow-backend/docker-compose.yaml` (web/db/redis/clamav/worker healthy at run). Django `Client` tests ran in `transaction.atomic()` and deliberately raised a sentinel exception after each check, so created users/parts/revisions were rolled back. No source code was modified.
+
+## Results
+
+1. **Missing If-Match accepted (confirmed)**
+   - Request: PATCH `/api/v1/parts/{part_id}/revisions/{revision_id}/` as engineer, JSON `{"name":"changed"}`, no `If-Match`.
+   - Response: HTTP 200; response revision name was `changed`.
+   - Expected V1.6 §4.2/§9.1/§11.2: every write must require `If-Match`, missing header -> `428 PRECONDITION_REQUIRED`.
+   - Code: `plm/views.py:343-345` uses `if expected and ...`, so absent header skips check.
+
+2. **Cross-engineer draft edit accepted (confirmed)**
+   - Setup: draft Revision submitter `audit_owner2`; second engineer `audit_other2` PATCHed it with `If-Match: 1`.
+   - Response: HTTP 200; returned name was `hijacked`.
+   - Expected: only submitting engineer may edit own draft; other engineer should be denied (`403/409`).
+   - Code: `PartRevisionViewSet.perform_update` checks only draft state/ETag, no `current.submitter_id == request.user.id` ownership check.
+
+3. **AttachmentVersion path crashes against running DB schema (confirmed)**
+   - Calling attachment/version creation or release gate in the running container raised PostgreSQL `UndefinedColumn: column plm_attachmentversion.tenant_id does not exist`.
+   - The runtime model (`plm/models.py:255-270`) requires `AttachmentVersion.tenant_id`; migration `0012_v16_release_entities.py` creates the table without `tenant_id` in the running database (only prior schema columns). Thus any code querying `attachment.versions` (`views.py:49-54`) or creating a version fails HTTP 500 rather than a stable error.
+   - This is independently visible in dynamic run output: both unknown-scan fixture creation and release transition failed with the same `ProgrammingError`.
+
+4. **Unknown encryption scan could not reach policy branch because of schema mismatch**
+   - Intended dynamic call `jobs.scan_attachment` with `encryption_mode='unknown'` was blocked by the schema error above before scan execution. Static branch remains `jobs.py:65-77`: unknown/transparent content is marked `available` without calling ClamAV. The team will classify transparent/opaque behavior as a policy freeze issue, but the DB mismatch is a concrete blocker.
+
+## Raw response excerpts
+
+```
+TEST no_if_match_patch status= 200 ... "name":"changed"
+TEST cross_engineer_patch status= 200 ... "name":"hijacked"
+TEST_EXCEPTION test_unknown_scan ProgrammingError column plm_attachmentversion.tenant_id does not exist
+TEST_EXCEPTION test_release_no_placement ProgrammingError column plm_attachmentversion.tenant_id does not exist
+```
+
+Container probes: `GET http://localhost:8000/healthz/` -> 200 `{"status":"ok"}`; unauthenticated `GET /api/v1/admin/settings/` -> 403.
+
+5. **Revision transition without If-Match accepted (confirmed)**
+   - Engineer POSTed `/api/v1/parts/{part_id}/revisions/{revision_id}/transition/` with `{"action":"submit"}` and no `If-Match`.
+   - Response: HTTP 200 and state transitioned to `pending_review`.
+   - Expected: `428 PRECONDITION_REQUIRED`; code `views.py:363-364` only compares when header is present.
