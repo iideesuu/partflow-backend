@@ -85,3 +85,39 @@ class APICompatibilityTests(TestCase):
         self.assertEqual(response.status_code, 403)
         response = self.client.post(f'/api/v1/attachment-versions/{version.pk}/download', {'mode':'bad'}, format='json')
         self.assertEqual(response.status_code, 422)
+
+    def test_missing_import_confirmation_secret_exposes_safe_retry(self):
+        from datetime import timedelta
+        from django.core.cache import cache
+        from django.utils import timezone
+        from unittest.mock import patch
+        from .models import ImportJob, UploadSession, UserSecurity
+        engineer = get_user_model().objects.create_user(username='confirm_retry', password='test-only')
+        engineer.groups.add(Group.objects.get_or_create(name='plm:engineer')[0])
+        UserSecurity.objects.create(user=engineer, permission_version=1)
+        session = UploadSession.objects.create(filename='import.csv', object_key='retry-x', bucket='plm-quarantine',
+                                               size=1, state='uploaded', owner=engineer, purpose='import_source',
+                                               expires_at=timezone.now() + timedelta(hours=1))
+        job = ImportJob.objects.create(kind='part', upload_session=session, tenant_id='default', actor=engineer,
+                                       permission_version=1, status='awaiting_confirmation',
+                                       confirm_token_hash='a' * 64,
+                                       confirm_expires_at=timezone.now() + timedelta(minutes=5))
+        cache.delete(f'plm:import-confirm:{job.pk}')
+        self.client.force_authenticate(engineer)
+        detail = self.client.get(f'/api/v1/jobs/{job.pk}/')
+        self.assertEqual(detail.status_code, 200, detail.content)
+        self.assertIsNone(detail.data['confirm_token'])
+        self.assertEqual(detail.data['allowed_actions'], ['retry', 'cancel'])
+        with patch('plm.views.run_import_job.delay') as enqueue:
+            retry = self.client.post(f'/api/v1/imports/{job.pk}/actions/', {'action':'retry'}, format='json',
+                                     HTTP_IF_MATCH='1', HTTP_IDEMPOTENCY_KEY='retry-1')
+        self.assertEqual(retry.status_code, 202, retry.content)
+        enqueue.assert_called_once()
+        replay = self.client.post(f'/api/v1/imports/{job.pk}/actions/', {'action':'retry'}, format='json',
+                                  HTTP_IF_MATCH='1', HTTP_IDEMPOTENCY_KEY='retry-1')
+        self.assertEqual(replay.status_code, 202, replay.content)
+        self.assertEqual(replay.data['id'], retry.data['id'])
+        enqueue.assert_called_once()
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'expired')
+        self.assertEqual(job.confirm_token_hash, '')

@@ -66,7 +66,7 @@ _CATEGORY_HEADER = [
     "code", "major_code", "minor_code", "name", "major_name", "path",
     "attribute_group", "parent_code", "parent_name", "description",
     "aliases", "standard_references", "is_selectable", "part_nature",
-    "sort_order", "catalog_version", "is_enabled", "is_leaf",
+    "sort_order", "catalog_version", "is_enabled", "is_leaf", "attribute_schema", "is_active",
 ]
 _PART_HEADER = [
     "part_code", "category_code", "revision", "revision_seq", "name",
@@ -88,7 +88,10 @@ _BOM_HEADER = [
 def _safe_cell(value: Any) -> str:
     """Escape a value for spreadsheet consumers while retaining its text."""
 
-    text = "" if value is None else (str(value).lower() if isinstance(value, bool) else str(value))
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = "" if value is None else (str(value).lower() if isinstance(value, bool) else str(value))
     return "'" + text if text.startswith(_DANGEROUS_PREFIXES) else text
 
 
@@ -100,6 +103,8 @@ def _json_cell(value: Any) -> Any:
     if isinstance(value, (Decimal,)):
         # Decimal text is stable and does not lose trailing precision in JSON.
         return str(value)
+    if isinstance(value, (dict, list)):
+        return value
     return str(value)
 
 
@@ -287,6 +292,7 @@ def export_rows(kind: str, filters: Mapping[str, Any] | None, tenant_id: str):
                     c.description, c.aliases, c.standard_references,
                     c.is_selectable, c.part_nature, c.sort_order,
                     c.catalog_version, c.is_enabled, c.is_leaf,
+                    c.attribute_schema, c.is_enabled,
                 )
 
         return _CATEGORY_HEADER, rows()

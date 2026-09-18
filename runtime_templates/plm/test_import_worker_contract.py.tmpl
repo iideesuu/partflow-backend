@@ -8,8 +8,8 @@ from django.core.cache import cache
 from django.test import TestCase
 from django.utils import timezone
 from .jobs import (
-    _commit_boms, _commit_parts, _issue_confirm_token,
-    _validate_commit_binding, cancel_import_job, process_import_job,
+    _commit_boms, _commit_parts, _issue_confirm_token, _preview_hash,
+    _complete_category_hierarchy, _validate_category, _validate_commit_binding, cancel_import_job, process_import_job,
 )
 from .models import (
     BOM, BOMRevision, Category, ImportJob, Part, PartRevision,
@@ -18,6 +18,36 @@ from .models import (
 
 
 class ImportWorkerContractTests(TestCase):
+    def test_new_catalog_csv_category_fields_are_normalized_losslessly(self):
+        row = {
+            'code': '0101', 'parent_code': '01', 'name': '螺母',
+            'aliases': '["螺帽"]', 'standard_references': '["ISO 4032"]',
+            'attribute_schema': '{"groups":[{"code":"COMMON"}]}',
+            'is_selectable': 'true', 'is_active': 'false',
+            'sort_order': '7', 'part_nature': 'STD', 'catalog_version': '4.0.0',
+        }
+        normalized = _validate_category(row, 0)
+        self.assertEqual((normalized['major_code'], normalized['minor_code']), ('01', '01'))
+        self.assertEqual(normalized['attribute_schema'], {'groups': [{'code': 'COMMON'}]})
+        self.assertFalse(normalized['is_enabled'])
+
+    def test_major_category_code_round_trips_as_two_digits(self):
+        self.assertEqual(Category(major_code='01', minor_code='00').code, '01')
+
+    def test_category_legacy_text_aliases_remain_compatible(self):
+        row = {'code': '0101', 'parent_code': '01', 'name': '螺母', 'aliases': '螺帽;六角螺母'}
+        self.assertEqual(_validate_category(row, 0)['aliases'], '螺帽;六角螺母')
+
+    def test_category_hierarchy_is_completed_after_all_rows_are_read(self):
+        child = _validate_category({'code': '0101', 'parent_code': '01', 'name': '螺母'}, 0)
+        parent = _validate_category({'code': '01', 'name': '紧固件'}, 1)
+        with self.assertRaises(Exception):
+            _complete_category_hierarchy([child])
+        _complete_category_hierarchy([child, parent])
+        self.assertEqual(child['major_name'], '紧固件')
+        self.assertEqual(child['parent_name'], '紧固件')
+        self.assertEqual(child['path'], '紧固件/螺母')
+
     def setUp(self):
         self.category = Category.objects.create(major_code='98', minor_code='01', name='Test',
                                                 is_selectable=True, is_leaf=True, catalog_version='4.0.0')
@@ -112,5 +142,21 @@ class ImportWorkerContractTests(TestCase):
         self.job.save(update_fields=['confirm_token_hash'])
         UserSecurity.objects.filter(user=self.user).update(permission_version=5)
         with patch('plm.jobs._catalog_fingerprint', return_value='fp'), patch('plm.jobs._session_input_hash', return_value='a' * 64):
+            with self.assertRaisesRegex(ValueError, 'STALE_CONFIRMATION'):
+                _validate_commit_binding(self.job, [], 'a' * 64)
+
+    def test_binding_rejects_missing_cache_secret(self):
+        token = 'cache-only-secret'
+        self.job.status = 'awaiting_confirmation'
+        self.job.confirm_expires_at = timezone.now() + timedelta(minutes=5)
+        self.job.confirm_token_hash = hashlib.sha256(token.encode()).hexdigest()
+        self.job.input_hash = 'a' * 64
+        self.job.preview_hash = _preview_hash([])
+        self.job.catalog_version = '4.0.0'
+        self.job.summary = {'actor_id': self.user.pk, 'catalog_fingerprint': 'fp'}
+        self.job.save(update_fields=['status', 'confirm_expires_at', 'confirm_token_hash', 'input_hash',
+                                     'preview_hash', 'catalog_version', 'summary'])
+        cache.delete(f'plm:import-confirm:{self.job.pk}')
+        with patch('plm.jobs._catalog_fingerprint', return_value='fp'):
             with self.assertRaisesRegex(ValueError, 'STALE_CONFIRMATION'):
                 _validate_commit_binding(self.job, [], 'a' * 64)

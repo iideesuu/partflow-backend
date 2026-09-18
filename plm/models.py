@@ -18,6 +18,10 @@ class Category(models.Model):
     description = models.TextField(blank=True)
     aliases = models.CharField(max_length=500, blank=True)
     standard_references = models.CharField(max_length=500, blank=True)
+    # Structured per-category attributes from the PLM catalog.  Keep this as
+    # JSON so import/export preserves nested attribute groups and their
+    # validation metadata instead of flattening it into a string column.
+    attribute_schema = models.JSONField(default=dict, blank=True)
     is_selectable = models.BooleanField(default=True)
     part_nature = models.CharField(max_length=32, blank=True)
     sort_order = models.PositiveIntegerField(default=0)
@@ -28,7 +32,7 @@ class Category(models.Model):
         constraints = [models.UniqueConstraint(fields=['major_code','minor_code'], name='uniq_category_code')]
         ordering = ['major_code','minor_code']
     @property
-    def code(self): return f'{self.major_code}{self.minor_code}'
+    def code(self): return self.major_code if self.minor_code == '00' else f'{self.major_code}{self.minor_code}'
 
 class Unit(models.Model):
     code = models.CharField(max_length=32, unique=True)

@@ -39,3 +39,9 @@ Container probes: `GET http://localhost:8000/healthz/` -> 200 `{"status":"ok"}`;
    - Engineer POSTed `/api/v1/parts/{part_id}/revisions/{revision_id}/transition/` with `{"action":"submit"}` and no `If-Match`.
    - Response: HTTP 200 and state transitioned to `pending_review`.
    - Expected: `428 PRECONDITION_REQUIRED`; code `views.py:363-364` only compares when header is present.
+
+## Confirmation-token recovery verification (2026-09-18)
+
+- Container test command: `docker compose run --rm -e REDIS_URL=redis://redis:6379/14 web python manage.py test plm.test_import_worker_contract plm.test_api_contracts --noinput`
+- Result: 20 tests passed. Covered hashed-only persistence, cache-secret loss rejecting worker commit, job detail hiding `commit`, safe `retry` creating a fresh preview child, clearing the expired parent's hash, and same-key retry idempotency.
+- `scripts/sync_runtime_templates.ps1 -Check`: passed (64 readable source/template pairs match).

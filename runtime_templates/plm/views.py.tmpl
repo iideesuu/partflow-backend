@@ -741,6 +741,7 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
         return Response({'id':str(obj.id),'bucket':bucket,'object_key':key,'upload_id':upload_id,
                          'total_chunks':chunks,'part_urls':urls,'part_attempt':1,
                          'signed_headers':{},'expected_length':size,
+                         'generation':obj.generation,'state':obj.state,
                          'expires_at':obj.expires_at}, status=201)
     def retrieve(self, request, pk=None):
         try: obj=_get_upload(request, pk)
@@ -837,6 +838,18 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
             return Response(UploadSessionSerializer(obj).data)
         return Response({'code':'STATE_TRANSITION_INVALID','detail':'action must be finalize or cancel'}, status=400)
 
+def _available_import_confirm_token(job, user):
+    """A lost/expired cache secret requires a fresh preview, never reissuance."""
+    if (job.status != 'awaiting_confirmation' or job.actor_id != user.id or
+            not job.confirm_expires_at or job.confirm_expires_at <= timezone.now() or
+            job.permission_version != getattr(getattr(user, 'security', None), 'permission_version', 1)):
+        return None
+    token = cache.get(_confirm_cache_key(job.id))
+    if not token or not hmac.compare_digest(hashlib.sha256(str(token).encode()).hexdigest(), job.confirm_token_hash):
+        return None
+    return token
+
+
 class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
     write_roles = ('engineer','admin')
     queryset=ImportJob.objects.all().order_by('-created_at'); serializer_class=ImportJobSerializer
@@ -870,11 +883,15 @@ class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         expected = request.headers.get('If-Match')
         if not expected:
             return Response({'code':'PRECONDITION_REQUIRED','detail':'If-Match header is required'}, status=428)
-        if expected.strip('"') != str(job.row_version):
-            return Response({'code':'CONCURRENT_MODIFICATION','detail':'job changed; reload before action'}, status=409)
         operation_key = str(request.headers.get('Idempotency-Key') or '').strip()
         if not operation_key:
             return Response({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'}, status=428)
+        if name == 'retry' and job.actor_id == request.user.id:
+            existing = job.retries.filter(idempotency_key=operation_key, actor=request.user).first()
+            if existing:
+                return Response(self.get_serializer(existing).data, status=202)
+        if expected.strip('"') != str(job.row_version):
+            return Response({'code':'CONCURRENT_MODIFICATION','detail':'job changed; reload before action'}, status=409)
         if name=='commit':
             token = str(request.data.get('confirm_token') or '')
             now = timezone.now()
@@ -894,10 +911,32 @@ class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
         elif name=='cancel':
             job.idempotency_key = operation_key; job.save(update_fields=['idempotency_key','updated_at']); cancel_import_job(job.id)
         elif name=='retry':
-            if job.status not in ('failed', 'completed_with_errors'):
-                return Response({'code':'STATE_TRANSITION_INVALID','detail':'only failed imports can be retried'}, status=409)
-            child = ImportJob.objects.create(kind=job.kind, upload_session=job.upload_session, tenant_id=job.tenant_id,
-                actor=request.user, permission_version=job.permission_version, parent_job=job, idempotency_key=operation_key)
+            with transaction.atomic():
+                job = ImportJob.objects.select_for_update().get(pk=job.pk)
+                if job.actor_id != request.user.id:
+                    return Response({'code':'PERMISSION_DENIED','detail':'only the import owner may retry'}, status=403)
+                existing = job.retries.filter(idempotency_key=operation_key, actor=request.user).first()
+                if existing:
+                    return Response(self.get_serializer(existing).data, status=202)
+                if expected.strip('"') != str(job.row_version):
+                    return Response({'code':'CONCURRENT_MODIFICATION','detail':'job changed; reload before action'}, status=409)
+                stale_confirmation = job.status == 'awaiting_confirmation' and not _available_import_confirm_token(job, request.user)
+                if job.status not in ('failed', 'completed_with_errors', 'expired') and not stale_confirmation:
+                    return Response({'code':'STATE_TRANSITION_INVALID','detail':'only failed or expired imports can be retried'}, status=409)
+                if stale_confirmation:
+                    job.status = 'expired'
+                    job.confirm_token_hash = ''
+                    job.confirm_expires_at = None
+                    job.row_version += 1
+                    job.summary = {**(job.summary or {}), 'confirmation_error': 'STALE_CONFIRMATION'}
+                    job.summary.pop('confirm_token', None)
+                    job.save(update_fields=['status','confirm_token_hash','confirm_expires_at','row_version','summary','updated_at'])
+                    transaction.on_commit(lambda: cache.delete(_confirm_cache_key(job.id)))
+                child, created = ImportJob.objects.get_or_create(parent_job=job, idempotency_key=operation_key,
+                    defaults={'kind':job.kind, 'upload_session':job.upload_session, 'tenant_id':job.tenant_id,
+                              'actor':request.user, 'permission_version':getattr(getattr(request.user, 'security', None), 'permission_version', 1)})
+            if not created:
+                return Response(self.get_serializer(child).data, status=202)
             try: run_import_job.delay(str(child.id), commit=False)
             except Exception: run_import_job(str(child.id), commit=False)
         else: return Response({'detail':'action must be commit, cancel, or retry'}, status=400)
@@ -1059,11 +1098,16 @@ def job_detail(request, pk):
                 if user_role(request.user) not in ('admin','sysadmin'):
                     qs = qs.filter(actor=request.user)
                 job=qs.get()
-            summary=getattr(job,'summary',None) or {}
-            confirm_token = cache.get(_confirm_cache_key(job.id)) if kind == 'import' and job.status == 'awaiting_confirmation' else None
+            summary=dict(getattr(job,'summary',None) or {})
+            summary.pop('confirm_token', None)
+            confirm_token = _available_import_confirm_token(job, request.user) if kind == 'import' else None
             actions = ['cancel'] if job.status in ('queued','running') else []
-            if kind == 'import' and job.status == 'awaiting_confirmation': actions = ['commit','cancel']
-            if kind == 'import' and job.status == 'completed_with_errors': actions = ['retry']
+            if kind == 'import' and job.status == 'awaiting_confirmation':
+                actions = ['commit','cancel'] if confirm_token else ['retry','cancel']
+                if not confirm_token: summary['confirmation_error'] = 'STALE_CONFIRMATION'
+            if kind == 'import' and job.status in ('failed', 'completed_with_errors', 'expired'): actions = ['retry']
+            if kind == 'import' and job.actor_id != request.user.id:
+                actions = [action for action in actions if action not in ('commit','retry')]
             response=Response({'job_id':str(job.id),'id':str(job.id),'job_type':kind,'subject_type':'upload_session' if kind!='export' else 'export','subject_id':str(getattr(job,'upload_session_id',job.id)),'execution_state':job.status,'status':job.status,'commit_state':getattr(job,'business_state','none'),'row_version':getattr(job,'row_version',1),'summary':summary,'confirm_token':confirm_token,'confirm_expires_at':getattr(job,'confirm_expires_at',None),'progress':summary.get('progress',100 if job.status=='completed' else 0),'attempt':summary.get('attempt',0),'row_count':getattr(job,'row_count',summary.get('total',0)),'error_count':getattr(job,'summary',{}).get('error_count',1 if getattr(job,'error','') else 0),'allowed_actions':actions,'created_at':job.created_at,'updated_at':getattr(job,'updated_at',job.created_at),'expires_at':getattr(job,'artifact_expires_at',None),'audit_id':None})
             response['ETag'] = '"' + str(getattr(job,'row_version',1)) + '"'
             return response

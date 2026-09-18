@@ -184,6 +184,37 @@ def _text(row, *names, default=""):
     return default
 
 
+def _json_cell(row, name, *, default, expected):
+    """Parse a JSON CSV cell while retaining a useful row-level error."""
+    raw_value = row.get(name)
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        return default
+    if isinstance(raw_value, expected):
+        return raw_value
+    raw = str(raw_value).strip()
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        # aliases/standard_references historically accepted free text. Keep
+        # those rows importable while still rejecting cells that advertise a
+        # JSON structure but are malformed. attribute_schema always requires
+        # an object and therefore does not take this compatibility path.
+        if expected is list and raw[:1] not in ('[', '{'):
+            return raw
+        raise ValueError(f"{name} must contain valid JSON: {exc}")
+    if not isinstance(value, expected):
+        expected_name = 'array' if expected is list else 'object'
+        raise ValueError(f"{name} must contain a JSON {expected_name}")
+    return value
+
+
+def _category_json_text(row, name):
+    value = row.get(name)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return _text(row, name)
+
+
 def _category_ref(row):
     code = _text(row, "code", "category_code")
     if not code:
@@ -210,6 +241,15 @@ def _validate_category(row, index):
         if sort_order < 0: raise ValueError
     except ValueError:
         raise ValueError("sort_order must be a non-negative integer")
+    # Validate JSON cells at dry-run time.  aliases and standard references
+    # remain text columns for backwards compatibility and byte-preserving CSV
+    # round trips; attribute_schema is stored as structured JSON.
+    _json_cell(row, "aliases", default=[], expected=list)
+    _json_cell(row, "standard_references", default=[], expected=list)
+    attribute_schema = _json_cell(row, "attribute_schema", default={}, expected=dict)
+    active = _text(row, "is_active", "is_enabled", default="true").lower()
+    if active not in ("true", "false", "1", "0", "yes", "no"):
+        raise ValueError("is_active must be a boolean")
     return {"major_code": major, "minor_code": minor,
             "name": _text(row, "name"),
             "major_name": _text(row, "major_name", "parent_name", default=_text(row, "name")),
@@ -217,14 +257,60 @@ def _validate_category(row, index):
             "parent_name": _text(row, "parent_name"),
             "path": _text(row, "path", "full_path"),
             "description": _text(row, "description"),
-            "aliases": _text(row, "aliases"),
-            "standard_references": _text(row, "standard_references"),
+            "aliases": _category_json_text(row, "aliases"),
+            "standard_references": _category_json_text(row, "standard_references"),
+            "attribute_schema": attribute_schema,
             "attribute_group": _text(row, "attribute_group", "attribute_groups"),
             "part_nature": _text(row, "part_nature"),
             "catalog_version": _text(row, "catalog_version"),
             "is_selectable": selectable in ("true", "1", "yes"),
+            "is_enabled": active in ("true", "1", "yes"),
             "sort_order": sort_order,
             "is_leaf": minor != "00"}
+
+
+def _complete_category_hierarchy(rows):
+    """Fill parent-derived fields after all rows have been validated.
+
+    CSV order is not a hierarchy contract; a child may precede its parent.
+    Parents already in the catalog are accepted for incremental imports.
+    """
+    imported = {f"{row['major_code']}{row['minor_code']}": row for row in rows}
+    existing_codes = set(
+        Category.objects.filter(minor_code='00').values_list('major_code', flat=True)
+    )
+    existing = {
+        row.major_code: row
+        for row in Category.objects.filter(minor_code='00')
+    }
+    for row in rows:
+        if row['minor_code'] == '00':
+            row['major_name'] = row.get('major_name') or row['name']
+            row['path'] = row.get('path') or row['name']
+            row['parent_code'] = ''
+            row['parent_name'] = ''
+            continue
+        parent_code = row.get('parent_code') or row['major_code']
+        parent = imported.get(f"{parent_code}00") or existing.get(parent_code)
+        if parent is None and parent_code not in existing_codes:
+            raise ValueError(f"parent category not found: {parent_code}")
+        parent_name = row.get('parent_name')
+        major_name = row.get('major_name')
+        parent_path = ''
+        if parent is not None:
+            if hasattr(parent, 'name'):
+                parent_name = parent_name or parent.name
+                major_name = parent.name
+                parent_path = parent.path
+            else:
+                parent_name = parent_name or parent.get('name', '')
+                major_name = parent.get('name', '')
+                parent_path = parent.get('path', '')
+        row['parent_code'] = parent_code
+        row['parent_name'] = parent_name or ''
+        row['major_name'] = major_name or row['parent_name']
+        row['path'] = row.get('path') or (f"{parent_path}/{row['name']}" if parent_path else f"{row['parent_name']}/{row['name']}")
+    return rows
 
 
 def _validate_part(row, index):
@@ -437,6 +523,11 @@ def _parse_import_job(job):
             parsed.append(normalized)
         except Exception as exc:
             errors.append({"row": index + 2, "message": str(exc), "data": row})
+    if job.kind == 'category' and not errors:
+        try:
+            _complete_category_hierarchy(parsed)
+        except Exception as exc:
+            errors.append({'row': 0, 'message': str(exc)})
     return parsed, errors, total, hashlib.sha256(raw).hexdigest()
 
 

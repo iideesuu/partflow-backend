@@ -5,7 +5,7 @@ class CategorySerializer(serializers.ModelSerializer):
     code = serializers.ReadOnlyField()
     class Meta:
         model = Category
-        fields = ['id','major_code','minor_code','code','name','major_name','path','attribute_group','parent_code','parent_name','description','aliases','standard_references','is_selectable','part_nature','sort_order','catalog_version','is_enabled','is_leaf']
+        fields = ['id','major_code','minor_code','code','name','major_name','path','attribute_group','parent_code','parent_name','description','aliases','standard_references','attribute_schema','is_selectable','part_nature','sort_order','catalog_version','is_enabled','is_leaf']
         read_only_fields = ['id','code']
     def validate(self, attrs):
         for f in ('major_code','minor_code'):
