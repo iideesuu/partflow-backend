@@ -18,7 +18,7 @@ def _allowed(request):
 def _version(pk):
     return get_object_or_404(AttachmentVersion.objects.select_related('attachment','attachment__revision','attachment__upload_session'), pk=pk)
 def _usable(v):
-    return v.security_state in ('available','opaque') and not v.rescan_required
+    return v.security_state == 'available' and not v.rescan_required
 
 def _parse_range(value, size):
     """Parse one RFC 7233 byte range and return (start, end), or None."""

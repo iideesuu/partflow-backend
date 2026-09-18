@@ -14,6 +14,7 @@ class CategorySerializer(serializers.ModelSerializer):
 class UnitSerializer(serializers.ModelSerializer):
     class Meta: model = Unit; fields = '__all__'
 class PartRevisionSerializer(serializers.ModelSerializer):
+    part_id = serializers.UUIDField(source='part_id', read_only=True)
     unit_code = serializers.CharField(source='unit.code', read_only=True)
     part_code = serializers.CharField(source='part.part_code', read_only=True)
     attachment_count = serializers.IntegerField(source='attachments.count', read_only=True)
@@ -92,8 +93,8 @@ class PartRevisionSerializer(serializers.ModelSerializer):
         return value
     class Meta:
         model = PartRevision
-        fields = ['id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','allowed_actions','can_edit','created_at']
-        read_only_fields = ['id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
+        fields = ['id','part_id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','allowed_actions','can_edit','created_at']
+        read_only_fields = ['id','part_id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
         extra_kwargs = {'name': {'required': False}, 'revision': {'required': False}}
 class PartSerializer(serializers.ModelSerializer):
     initial_revision = PartRevisionSerializer(write_only=True, required=False)
@@ -103,7 +104,7 @@ class PartSerializer(serializers.ModelSerializer):
     class Meta:
         model = Part
         fields = ['id','part_code','part_number','number_request','category_id','category_code','status','tenant_id','row_version','created_at','updated_at','revisions','initial_revision']
-        read_only_fields = ['id','part_number','created_at','updated_at','revisions','status','row_version']
+        read_only_fields = ['id','part_number','created_at','updated_at','revisions','status','row_version','tenant_id']
     def validate_part_code(self, value):
         import re
         if not re.fullmatch(r'\d{4}-\d{5}', value) or value.endswith('-00000'): raise serializers.ValidationError('invalid part number')
@@ -181,13 +182,13 @@ class BOMRevisionSerializer(serializers.ModelSerializer):
     class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items','allowed_actions','can_edit']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher','allowed_actions','can_edit']
 class BOMSerializer(serializers.ModelSerializer):
     revisions = BOMRevisionSerializer(many=True, read_only=True)
-    class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','created_at','revisions']; read_only_fields = ['id','created_at','revisions']
+    class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','row_version','created_at','revisions']; read_only_fields = ['id','created_at','revisions','row_version']
     def validate_bom_type(self, value):
         if str(value).upper() != 'EBOM':
             raise serializers.ValidationError('BOM_TYPE_NOT_SUPPORTED: only EBOM is supported')
         return 'EBOM'
 class UploadSessionSerializer(serializers.ModelSerializer):
-    class Meta: model = UploadSession; fields = '__all__'; read_only_fields = ['id','object_key','bucket','state','upload_id','created_at']
+    class Meta: model = UploadSession; fields = '__all__'; read_only_fields = ['id','object_key','bucket','state','upload_id','s3_version_id','tenant_id','owner','generation','created_at']
 class ImportJobSerializer(serializers.ModelSerializer):
     class Meta: model = ImportJob; fields = '__all__'; read_only_fields = ['id','status','summary','error_report_key','created_at']
 class ExportJobSerializer(serializers.ModelSerializer):

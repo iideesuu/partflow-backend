@@ -52,6 +52,23 @@ class APICompatibilityTests(TestCase):
         response = self.client.get('/api/v1/jobs/00000000-0000-0000-0000-000000000000/')
         self.assertEqual(response.status_code, 404)
 
+    def test_jobs_index_kind_filter_and_export_shape(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from .models import ExportJob, ImportJob, UploadSession
+        session = UploadSession.objects.create(filename='import.csv', object_key='x', bucket='plm-quarantine',
+                                               size=1, expires_at=timezone.now() + timedelta(hours=1))
+        ImportJob.objects.create(kind='part', upload_session=session)
+        ExportJob.objects.create(kind='part', format='json')
+        self.client.force_authenticate(self.admin)
+        imports = self.client.get('/api/v1/jobs/?kind=import')
+        self.assertEqual(imports.status_code, 200, imports.content)
+        self.assertTrue(all(row['job_type'] == 'import' for row in imports.data['results']))
+        exports = self.client.get('/api/v1/jobs/?kind=export')
+        self.assertEqual(exports.status_code, 200, exports.content)
+        self.assertTrue(all(row['job_type'] == 'export' for row in exports.data['results']))
+        self.assertEqual(exports.data['results'][0]['format'], 'json')
+
     def test_attachment_version_read_contract_requires_license(self):
         from .models import Part, PartRevision, UploadSession, PartAttachment, AttachmentVersion
         from django.utils import timezone

@@ -1,4 +1,4 @@
-import uuid
+import uuid, hashlib, json
 from django.db import models
 
 class Category(models.Model):
@@ -98,6 +98,7 @@ class BOM(models.Model):
     bom_code = models.CharField(max_length=64, unique=True)
     bom_type = models.CharField(max_length=8, default='EBOM')
     name = models.CharField(max_length=200, blank=True)
+    row_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
 
 class BOMRevision(models.Model):
@@ -125,7 +126,7 @@ class BOMItem(models.Model):
     class Meta: constraints = [models.UniqueConstraint(fields=['bom_revision','line_no'], name='uniq_bom_line')]
 
 class UploadSession(models.Model):
-    STATES = [('created','Created'),('uploaded','Uploaded'),('verified','Verified'),('failed','Failed'),('expired','Expired')]
+    STATES = [('created','Created'),('uploaded','Uploaded'),('verified','Verified'),('failed','Failed'),('expired','Expired'),('cancelled','Cancelled')]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     object_key = models.CharField(max_length=512, unique=True)
     bucket = models.CharField(max_length=128)
@@ -136,6 +137,11 @@ class UploadSession(models.Model):
     declared_sha256 = models.CharField(max_length=64, blank=True)
     state = models.CharField(max_length=20, choices=STATES, default='created')
     upload_id = models.CharField(max_length=255, blank=True)
+    s3_version_id = models.CharField(max_length=255, blank=True)
+    tenant_id = models.CharField(max_length=64, default='default')
+    owner = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='owned_upload_sessions')
+    purpose = models.CharField(max_length=32, default='attachment')
+    generation = models.PositiveIntegerField(default=1)
     expires_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -182,7 +188,30 @@ class AuditEvent(models.Model):
     resource_id = models.CharField(max_length=80, blank=True)
     success = models.BooleanField(default=True)
     details = models.JSONField(default=dict, blank=True)
+    # Correlators and a tamper-evident chain are part of the persisted audit
+    # contract.  ``entry_hash`` is SHA-256 over the canonical row payload and
+    # the previous entry hash; the append-only trigger is installed by the
+    # 0014 migration for PostgreSQL deployments.
+    request_id = models.CharField(max_length=128, blank=True, db_index=True)
+    job_id = models.CharField(max_length=128, blank=True, db_index=True)
+    prev_hash = models.CharField(max_length=64, blank=True)
+    entry_hash = models.CharField(max_length=64, blank=True, null=True, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    def save(self, *args, **kwargs):
+        # All application paths (including legacy modules that create an
+        # AuditEvent directly) receive the same chain metadata as record_audit.
+        # The PostgreSQL trigger makes later mutation impossible.
+        if self._state.adding and not self.entry_hash:
+            previous = type(self).objects.order_by('-created_at', '-id').first()
+            self.prev_hash = self.prev_hash or ((previous.entry_hash or '') if previous else '')
+            payload = {'id': str(self.id), 'actor': self.actor, 'action': self.action,
+                       'resource_type': self.resource_type, 'resource_id': self.resource_id,
+                       'success': bool(self.success), 'details': self.details or {},
+                       'request_id': self.request_id or '', 'job_id': self.job_id or '',
+                       'prev_hash': self.prev_hash or ''}
+            self.entry_hash = hashlib.sha256(json.dumps(payload, sort_keys=True,
+                separators=(',', ':'), default=str).encode()).hexdigest()
+        return super().save(*args, **kwargs)
     class Meta:
         ordering = ['-created_at']
 
@@ -254,7 +283,7 @@ class RevisionReview(models.Model):
 
 class AttachmentVersion(models.Model):
     """Immutable content identity associated with an attachment upload."""
-    SECURITY_STATES = [('scanning','Scanning'), ('available','Available'), ('quarantined','Quarantined'), ('rescanning','Rescanning'), ('rejected','Rejected')]
+    SECURITY_STATES = [('scanning','Scanning'), ('available','Available'), ('quarantined','Quarantined'), ('rescanning','Rescanning'), ('rejected','Rejected'), ('unscannable','Unscannable')]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant_id = models.CharField(max_length=64, default='default')
     attachment = models.ForeignKey(PartAttachment, related_name='versions', on_delete=models.PROTECT)

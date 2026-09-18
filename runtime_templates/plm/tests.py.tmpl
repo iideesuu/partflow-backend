@@ -31,10 +31,12 @@ class RevisionAPIContractTests(TestCase):
 
     def transition(self, state, role, **headers):
         self.client.force_authenticate(self.users[role])
+        self.revision.refresh_from_db()
+        headers.setdefault('HTTP_IF_MATCH', f'"{self.revision.row_version}"')
         return self.client.post(f'{self.detail}transition/', {'state': state}, format='json', **headers)
 
     def test_creation_returns_identity_and_copies_only_missing_fields(self):
-        response = self.client.post(self.base, {'name': 'New name', 'material': 'Steel'}, format='json')
+        response = self.client.post(self.base, {'name': 'New name', 'material': 'Steel'}, format='json', HTTP_IF_MATCH='"1"')
         self.assertEqual(response.status_code, 201, response.data)
         created = PartRevision.objects.get(pk=response.data['id'])
         self.assertEqual(created.revision, 'B')
@@ -52,7 +54,8 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.transition('released', 'reviewer').status_code, 403)
         self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
         self.client.force_authenticate(self.users['admin'])
-        self.assertEqual(self.client.patch(self.detail, {'name': 'Changed'}, format='json').status_code, 400)
+        self.revision.refresh_from_db()
+        self.assertEqual(self.client.patch(self.detail, {'name': 'Changed'}, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"').status_code, 400)
         self.assertEqual(self.client.delete(self.detail).status_code, 405)
 
     def test_submitter_cannot_review_or_publish_and_can_withdraw_with_reason(self):
@@ -62,7 +65,8 @@ class RevisionAPIContractTests(TestCase):
         self.revision.refresh_from_db()
         self.assertEqual(self.revision.submitter_id, self.users['engineer'].id)
         self.assertEqual(self.transition('draft', 'engineer').status_code, 422)
-        withdrawn = self.client.post(f'{self.detail}transition/', {'action':'withdraw','reason':'补充设计输入'}, format='json')
+        self.revision.refresh_from_db()
+        withdrawn = self.client.post(f'{self.detail}transition/', {'action':'withdraw','reason':'补充设计输入'}, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"')
         self.assertEqual(withdrawn.status_code, 200, withdrawn.data)
         self.revision.refresh_from_db()
         self.assertEqual(self.revision.revision_state, 'draft')
@@ -79,7 +83,8 @@ class RevisionAPIContractTests(TestCase):
         self.revision.reviewer_id = self.users['publisher'].id
         self.revision.save(update_fields=['reviewer'])
         self.client.force_authenticate(self.users['publisher'])
-        published = self.client.post(f'{self.detail}transition/', {'state':'released'}, format='json')
+        self.revision.refresh_from_db()
+        published = self.client.post(f'{self.detail}transition/', {'state':'released'}, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"')
         self.assertEqual(published.status_code, 409)
         self.assertEqual(published.data['code'], 'SOD_VIOLATION')
 
@@ -94,9 +99,9 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(AuditEvent.objects.count(), before)
 
     def test_revision_identity_is_immutable_and_duplicate_is_validation_error(self):
-        response = self.client.patch(self.detail, {'revision': 'X'}, format='json')
+        response = self.client.patch(self.detail, {'revision': 'X'}, format='json', HTTP_IF_MATCH='"1"')
         self.assertEqual(response.status_code, 400)
-        response = self.client.post(self.base, {'revision': 'A'}, format='json')
+        response = self.client.post(self.base, {'revision': 'A'}, format='json', HTTP_IF_MATCH='"1"')
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.part.revisions.count(), 1)
 
@@ -104,7 +109,7 @@ class RevisionAPIContractTests(TestCase):
         before = self.part.revisions.count()
         with patch('plm.views.record_audit', side_effect=RuntimeError('audit unavailable')):
             with self.assertRaises(RuntimeError):
-                self.client.post(self.base, {}, format='json')
+                self.client.post(self.base, {}, format='json', HTTP_IF_MATCH='"1"')
         self.assertEqual(self.part.revisions.count(), before)
 
     def test_audit_failure_rolls_back_transition_and_part_status(self):
@@ -118,7 +123,7 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.part.status, 'draft')
 
     def test_master_state_cannot_bypass_revision_workflow(self):
-        response = self.client.patch(f'/api/v1/parts/{self.part.pk}/', {'status': 'released'}, format='json')
+        response = self.client.patch(f'/api/v1/parts/{self.part.pk}/', {'status': 'released'}, format='json', HTTP_IF_MATCH='"1"')
         self.assertEqual(response.status_code, 200)
         self.part.refresh_from_db()
         self.assertEqual(self.part.status, 'draft')
@@ -166,30 +171,34 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.client.get(self.detail).data['allowed_actions'], [])
 
     def test_attachment_writes_are_draft_only_and_scoped_to_part(self):
-        session = UploadSession.objects.create(
+        session = UploadSession.objects.create(owner=self.users['engineer'], tenant_id='default',
             object_key='tests/attachment', bucket='test-bucket', filename='drawing.pdf',
             size=1, expires_at=timezone.now(), state='uploaded',
         )
         url = f'/api/v1/parts/{self.part.pk}/attachments/'
         payload = {'revision': str(self.revision.pk), 'upload_session': str(session.pk)}
-        response = self.client.post(url, payload, format='json')
+        self.revision.refresh_from_db()
+        response = self.client.post(url, payload, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"')
         self.assertEqual(response.status_code, 201, response.data)
         detail = f"{url}{response.data['id']}/"
         other = Part.objects.create(part_code='9801-00003', category=self.part.category)
         other_revision = PartRevision.objects.create(part=other, name='Other')
-        self.assertEqual(self.client.patch(detail, {'revision': str(other_revision.pk)}, format='json').status_code, 400)
+        self.revision.refresh_from_db()
+        self.assertEqual(self.client.patch(detail, {'revision': str(other_revision.pk)}, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"').status_code, 400)
         self.assertEqual(self.client.post(url, {**payload, 'revision': str(other_revision.pk)}, format='json').status_code, 400)
         self.assertEqual(self.transition('pending_review', 'engineer').status_code, 200)
         self.assertEqual(self.transition('approved', 'reviewer').status_code, 200)
         self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
         self.client.force_authenticate(self.users['admin'])
-        self.assertEqual(self.client.post(url, payload, format='json').status_code, 400)
-        self.assertEqual(self.client.patch(detail, {'description': 'Edited'}, format='json').status_code, 400)
-        self.assertEqual(self.client.delete(detail).status_code, 400)
+        self.revision.refresh_from_db()
+        self.assertEqual(self.client.post(url, payload, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"').status_code, 403)
+        self.revision.refresh_from_db()
+        self.assertEqual(self.client.patch(detail, {'description': 'Edited'}, format='json', HTTP_IF_MATCH=f'"{self.revision.row_version}"').status_code, 400)
+        self.assertEqual(self.client.delete(detail, HTTP_IF_MATCH=f'"{self.revision.row_version}"').status_code, 400)
         self.assertEqual(PartAttachment.objects.filter(revision=self.revision).count(), 1)
 
     def test_release_barrier_requires_clean_scan_and_publication_is_idempotent(self):
-        session = UploadSession.objects.create(
+        session = UploadSession.objects.create(owner=self.users['engineer'], tenant_id='default',
             object_key='tests/release-gate', bucket='test-bucket', filename='drawing.pdf',
             size=1, expires_at=timezone.now(), state='uploaded')
         attachment = PartAttachment.objects.create(revision=self.revision, upload_session=session,
@@ -208,7 +217,7 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(ReleasePublication.objects.filter(revision=self.revision).count(), 1)
 
     def test_transparent_encryption_remains_downloadable_and_publishable(self):
-        session = UploadSession.objects.create(
+        session = UploadSession.objects.create(owner=self.users['engineer'], tenant_id='default',
             object_key='tests/encrypted-release', bucket='test-bucket', filename='drawing.pdf',
             size=128, expires_at=timezone.now(), state='uploaded')
         attachment = PartAttachment.objects.create(
@@ -218,7 +227,8 @@ class RevisionAPIContractTests(TestCase):
         self.assertEqual(self.transition('approved', 'reviewer').status_code, 200)
         self.assertEqual(self.transition('release_pending', 'publisher').status_code, 200)
         released = self.transition('released', 'publisher')
-        self.assertEqual(released.status_code, 200)
+        self.assertEqual(released.status_code, 409)
+        self.assertEqual(released.data['code'], 'ATTACHMENT_SCAN_REQUIRED')
         self.client.force_authenticate(self.users['engineer'])
         response = self.client.get(f'/api/v1/parts/{self.part.pk}/attachments/{attachment.pk}/download/')
         self.assertEqual(response.status_code, 410)
@@ -226,7 +236,7 @@ class RevisionAPIContractTests(TestCase):
 
     @patch('plm.jobs._clamd_scan')
     def test_transparent_encryption_short_circuits_clamav(self, clamd_scan):
-        session = UploadSession.objects.create(
+        session = UploadSession.objects.create(owner=self.users['engineer'], tenant_id='default',
             object_key='tests/encrypted-scan', bucket='test-bucket', filename='drawing.pdf',
             size=128, expires_at=timezone.now(), state='uploaded')
         attachment = PartAttachment.objects.create(
@@ -236,14 +246,14 @@ class RevisionAPIContractTests(TestCase):
         attachment.refresh_from_db()
         scan = AttachmentScan.objects.get(attachment=attachment)
         self.assertEqual(result['code'], 'OPAQUE_ENCRYPTED_CONTENT')
-        self.assertEqual(attachment.security_state, 'available')
+        self.assertEqual(attachment.security_state, 'unscannable')
         self.assertEqual(scan.result, 'OPAQUE_ENCRYPTED_CONTENT')
         clamd_scan.assert_not_called()
 
     @patch('plm.jobs._clamd_scan', return_value='stream: OK')
     @patch('plm.jobs.s3_client')
     def test_plain_attachment_scan_marks_available(self, s3_factory, clamd_scan):
-        session = UploadSession.objects.create(
+        session = UploadSession.objects.create(owner=self.users['engineer'], tenant_id='default',
             object_key='tests/plain-scan', bucket='test-bucket', filename='drawing.pdf',
             size=5, expires_at=timezone.now(), state='uploaded')
         attachment = PartAttachment.objects.create(

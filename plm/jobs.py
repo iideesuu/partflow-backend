@@ -53,9 +53,8 @@ def scan_attachment(attachment_id):
 
     Transparent enterprise encryption is intentionally treated as opaque: the
     container only receives ciphertext, so a ClamAV ``OK`` verdict over those
-    bytes would be meaningless. Opaque content remains available to authorized
-    users for download, BOM binding and release; explicit malware and scanner
-    errors continue to quarantine or block the attachment.
+    bytes would be meaningless. Opaque content remains quarantined until an
+    explicit policy override is implemented by a trusted decryption service.
     """
     attachment = PartAttachment.objects.select_related('upload_session').get(pk=attachment_id)
     session = attachment.upload_session
@@ -65,14 +64,12 @@ def scan_attachment(attachment_id):
     if attachment.encryption_mode in ('transparent', 'unknown'):
         scan.status = 'opaque'; scan.result = 'OPAQUE_ENCRYPTED_CONTENT'; scan.error = 'encrypted or unknown content cannot be trusted as clean; upload authorized plaintext for container scanning or integrate a trusted decryption/scan service'; scan.finished_at = timezone.now()
         scan.save(update_fields=['status','result','error','finished_at'])
-        # The container cannot inspect enterprise-transparent ciphertext, but
-        # the encrypted object remains valid: authorized client environments
-        # can decrypt it after download. Keep it publishable while recording
-        # the opaque scan result for audit purposes.
-        attachment.security_state = 'available'; attachment.scan_error = scan.error; attachment.scanned_at = timezone.now()
+        # The container cannot inspect enterprise-transparent ciphertext. Keep
+        # the object explicitly unscannable and fail all release/download gates.
+        attachment.security_state = 'unscannable'; attachment.scan_error = scan.error; attachment.scanned_at = timezone.now()
         attachment.save(update_fields=['security_state','scan_error','scanned_at'])
         if version is not None:
-            version.security_state = 'available'; version.rescan_required = False
+            version.security_state = 'unscannable'; version.rescan_required = True
             version.save(update_fields=['security_state','rescan_required'])
         return {'status': 'opaque', 'code': 'OPAQUE_ENCRYPTED_CONTENT', 'attachment': str(attachment.id)}
     if session.size > CLAMAV_MAX_BYTES:
@@ -477,6 +474,12 @@ def finalize_upload_job(job_id):
     try:
         job.status = 'running'; job.save(update_fields=['status','updated_at'])
         _complete_upload_session(job.upload_session, job.parts)
+        # Keep the same optimistic-concurrency generation semantics as the
+        # synchronous finalize path.
+        session = job.upload_session
+        session.refresh_from_db()
+        session.generation += 1
+        session.save(update_fields=['generation'])
         job.status = 'completed'; job.save(update_fields=['status','updated_at'])
         return {'status': job.status, 'upload_session': str(job.upload_session_id)}
     except Exception as exc:

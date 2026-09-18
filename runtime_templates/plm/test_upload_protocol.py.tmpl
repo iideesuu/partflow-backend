@@ -15,7 +15,7 @@ class UploadProtocolTests(TestCase):
         self.client = APIClient(); self.client.force_authenticate(self.user)
 
     def session(self, **kwargs):
-        values = dict(filename='drawing.pdf', object_key='uploads/test-drawing', bucket='plm-quarantine', size=3, total_chunks=3, upload_id='mpu-test', state='created', expires_at=timezone.now() + timedelta(hours=1)); values.update(kwargs); return UploadSession.objects.create(**values)
+        values = dict(filename='drawing.pdf', object_key='uploads/test-drawing', bucket='plm-quarantine', size=3, total_chunks=3, upload_id='mpu-test', state='created', expires_at=timezone.now() + timedelta(hours=1), owner=self.user, tenant_id='default'); values.update(kwargs); return UploadSession.objects.create(**values)
 
     def test_list_parts_reconciles_all_pages(self):
         obj = self.session(); control = Mock(); control.list_parts.side_effect = [ {'Parts':[{'PartNumber':1,'ETag':'"etag-1"','Size':10}], 'IsTruncated':True, 'NextPartNumberMarker':'1'}, {'Parts':[{'PartNumber':2,'ETag':'"etag-2"','Size':20},{'PartNumber':3,'ETag':'"etag-3"','Size':30}], 'IsTruncated':False} ]
@@ -42,6 +42,18 @@ class UploadProtocolTests(TestCase):
 
     def test_presign_rejects_cancelled_session(self):
         obj = self.session(state='cancelled'); response = self.client.post(f'/api/v1/attachments/upload-sessions/{obj.pk}/parts/presign/', {'part_numbers':[1]}, format='json'); self.assertEqual(response.status_code, 409, response.content); self.assertEqual(response.data['code'], 'UPLOAD_SESSION_CANCELLED')
+
+    def test_cancel_uses_generation_if_match_and_increments_it(self):
+        obj = self.session()
+        missing = self.client.post(f'/api/v1/attachments/upload-sessions/{obj.pk}/actions/', {'action':'cancel'}, format='json')
+        self.assertEqual(missing.status_code, 428, missing.content)
+        self.assertEqual(missing.data['current_generation'], 1)
+        stale = self.client.post(f'/api/v1/attachments/upload-sessions/{obj.pk}/actions/', {'action':'cancel'}, format='json', HTTP_IF_MATCH='0')
+        self.assertEqual(stale.status_code, 409, stale.content)
+        done = self.client.post(f'/api/v1/attachments/upload-sessions/{obj.pk}/actions/', {'action':'cancel'}, format='json', HTTP_IF_MATCH='1')
+        self.assertEqual(done.status_code, 200, done.content)
+        self.assertEqual(done.data['state'], 'cancelled')
+        self.assertEqual(done.data['generation'], 2)
 
     @patch('plm.views.s3_presign')
     @patch('plm.views.s3_control')
