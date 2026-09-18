@@ -14,7 +14,7 @@ class CategorySerializer(serializers.ModelSerializer):
 class UnitSerializer(serializers.ModelSerializer):
     class Meta: model = Unit; fields = '__all__'
 class PartRevisionSerializer(serializers.ModelSerializer):
-    part_id = serializers.UUIDField(source='part_id', read_only=True)
+    part_id = serializers.UUIDField(read_only=True)
     unit_code = serializers.CharField(source='unit.code', read_only=True)
     part_code = serializers.CharField(source='part.part_code', read_only=True)
     attachment_count = serializers.IntegerField(source='attachments.count', read_only=True)
@@ -93,9 +93,14 @@ class PartRevisionSerializer(serializers.ModelSerializer):
         return value
     class Meta:
         model = PartRevision
-        fields = ['id','part_id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','allowed_actions','can_edit','created_at']
-        read_only_fields = ['id','part_id','created_at','revision_seq','row_version','revision_state','submitter','reviewer','publisher']
+        fields = ['id','part_id','part_code','revision','revision_seq','name','kind','business_lifecycle','unit','unit_code','standard_code','material','manufacturer','manufacturer_part_number','is_customized','rohs_standard','parameters','description','revision_state','row_version','effective_range','submitter','reviewer','publisher','attachment_count','publication_status','publication_id','allowed_actions','can_edit','created_at']
+        read_only_fields = ['id','part_id','created_at','revision_seq','row_version','revision_state','effective_range','submitter','reviewer','publisher']
         extra_kwargs = {'name': {'required': False}, 'revision': {'required': False}}
+    def validate(self, attrs):
+        incoming = getattr(self, 'initial_data', {}) or {}
+        if 'effective_range' in incoming:
+            raise serializers.ValidationError({'code': 'FIELD_NOT_WRITABLE', 'detail': 'effectivity bounds are server controlled'})
+        return attrs
 class PartSerializer(serializers.ModelSerializer):
     initial_revision = PartRevisionSerializer(write_only=True, required=False)
     revisions = PartRevisionSerializer(many=True, read_only=True)
@@ -132,27 +137,38 @@ class PartSerializer(serializers.ModelSerializer):
                 request.status='used'; request.save(update_fields=['status'])
             return part
 class BOMItemSerializer(serializers.ModelSerializer):
-    child_part_code = serializers.CharField(source='child_part_revision.part.part_code', read_only=True)
-    child_revision = serializers.CharField(source='child_part_revision.revision', read_only=True)
-    child_name = serializers.CharField(source='child_part_revision.name', read_only=True)
+    child_part_code = serializers.CharField(source='child_part_revision.part.part_code', read_only=True, allow_null=True)
+    child_revision = serializers.CharField(source='child_part_revision.revision', read_only=True, allow_null=True)
+    child_name = serializers.CharField(source='child_part_revision.name', read_only=True, allow_null=True)
+    child_bom_code = serializers.CharField(source='child_bom_revision.bom.bom_code', read_only=True, allow_null=True)
+    child_bom_revision_code = serializers.CharField(source='child_bom_revision.revision', read_only=True, allow_null=True)
     unit_code = serializers.CharField(source='unit.code', read_only=True)
     class Meta:
         model = BOMItem
-        fields = ['id','bom_revision','line_no','child_part_revision','child_part_code','child_revision','child_name','quantity','unit','unit_code','position','parent_item','no_position_reason']
+        fields = ['id','bom_revision','line_no','child_part_revision','child_part_code','child_revision','child_name','child_bom_revision','child_bom_code','child_bom_revision_code','quantity','unit','unit_code','position','parent_item','no_position_reason','alternative_group_id','alternative_role','priority','remarks']
         read_only_fields = ['id','child_part_code','child_revision','child_name','unit_code']
     def validate(self, attrs):
         br = attrs.get('bom_revision') or getattr(self.instance, 'bom_revision', None)
-        child = attrs.get('child_part_revision') or getattr(self.instance, 'child_part_revision', None)
+        child = attrs.get('child_part_revision', getattr(self.instance, 'child_part_revision', None))
+        child_bom = attrs.get('child_bom_revision', getattr(self.instance, 'child_bom_revision', None))
         quantity = attrs.get('quantity', getattr(self.instance, 'quantity', None))
         position = attrs.get('position', getattr(self.instance, 'position', '__NO_POSITION__'))
         parent = attrs.get('parent_item', getattr(self.instance, 'parent_item', None))
         reason = attrs.get('no_position_reason', getattr(self.instance, 'no_position_reason', ''))
         if position == '__NO_POSITION__' and not str(reason or '').strip():
             raise serializers.ValidationError({'no_position_reason': 'reason is required when position is omitted'})
+        if not child and not child_bom:
+            raise serializers.ValidationError({'child_part_revision': 'either child_part_revision or child_bom_revision is required'})
+        if child and child_bom:
+            raise serializers.ValidationError({'child_bom_revision': 'child part and child BOM cannot both be set'})
         from .bom_services import validate_bom_item
         validate_bom_item(bom_revision=br, child_part_revision=child, quantity=quantity,
                           unit=attrs.get('unit', getattr(self.instance, 'unit', None)),
-                          parent_item=parent, position=position, instance=self.instance)
+                          parent_item=parent, position=position, instance=self.instance,
+                          alternative_group_id=attrs.get('alternative_group_id', getattr(self.instance, 'alternative_group_id', None)),
+                          alternative_role=attrs.get('alternative_role', getattr(self.instance, 'alternative_role', 'primary')),
+                          priority=attrs.get('priority', getattr(self.instance, 'priority', None)),
+                          child_bom_revision=child_bom)
         return attrs
 class BOMRevisionSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True, read_only=True)
@@ -179,10 +195,15 @@ class BOMRevisionSerializer(serializers.ModelSerializer):
         if publish and state == 'release_failed': actions += ['retry_publish','abandon_publish']
         if role in ('publisher','admin') and state == 'released': actions.append('retire')
         return actions
-    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','submitter','reviewer','publisher','items','allowed_actions','can_edit']; read_only_fields=['revision_state','row_version','submitter','reviewer','publisher','allowed_actions','can_edit']
+    class Meta: model = BOMRevision; fields = ['id','bom','revision','root_part_revision','root_part_code','root_part_revision_code','revision_state','row_version','effective_range','submitter','reviewer','publisher','items','allowed_actions','can_edit']; read_only_fields=['revision_state','row_version','effective_range','submitter','reviewer','publisher','allowed_actions','can_edit']
+    def validate(self, attrs):
+        incoming = getattr(self, 'initial_data', {}) or {}
+        if 'effective_range' in incoming:
+            raise serializers.ValidationError({'code': 'FIELD_NOT_WRITABLE', 'detail': 'effectivity bounds are server controlled'})
+        return attrs
 class BOMSerializer(serializers.ModelSerializer):
     revisions = BOMRevisionSerializer(many=True, read_only=True)
-    class Meta: model = BOM; fields = ['id','bom_code','bom_type','name','row_version','created_at','revisions']; read_only_fields = ['id','created_at','revisions','row_version']
+    class Meta: model = BOM; fields = ['id','tenant_id','bom_code','bom_type','name','row_version','created_at','revisions']; read_only_fields = ['id','tenant_id','created_at','revisions','row_version']
     def validate_bom_type(self, value):
         if str(value).upper() != 'EBOM':
             raise serializers.ValidationError('BOM_TYPE_NOT_SUPPORTED: only EBOM is supported')
@@ -190,9 +211,9 @@ class BOMSerializer(serializers.ModelSerializer):
 class UploadSessionSerializer(serializers.ModelSerializer):
     class Meta: model = UploadSession; fields = '__all__'; read_only_fields = ['id','object_key','bucket','state','upload_id','s3_version_id','tenant_id','owner','generation','created_at']
 class ImportJobSerializer(serializers.ModelSerializer):
-    class Meta: model = ImportJob; fields = '__all__'; read_only_fields = ['id','status','summary','error_report_key','created_at']
+    class Meta: model = ImportJob; fields = '__all__'; read_only_fields = ['id','status','business_state','summary','error_report_key','tenant_id','actor','input_hash','preview_hash','catalog_version','permission_version','confirm_token_hash','confirm_expires_at','row_version','created_at','updated_at']
 class ExportJobSerializer(serializers.ModelSerializer):
-    class Meta: model = ExportJob; fields = '__all__'; read_only_fields = ['id','status','object_key','created_at']
+    class Meta: model = ExportJob; fields = '__all__'; read_only_fields = ['id','status','object_key','tenant_id','actor','template_version','snapshot_at','row_count','artifact_sha256','artifact_expires_at','download_count','row_version','created_at','updated_at']
 
 class PartAttachmentSerializer(serializers.ModelSerializer):
     versions = serializers.SerializerMethodField()

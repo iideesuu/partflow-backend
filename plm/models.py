@@ -1,5 +1,9 @@
 import uuid, hashlib, json
 from django.db import models
+from django.contrib.postgres.fields import DateTimeRangeField
+from django.contrib.postgres.constraints import ExclusionConstraint
+from django.contrib.postgres.fields import RangeOperators
+from django.db.models.expressions import RawSQL
 
 class Category(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -30,6 +34,10 @@ class Unit(models.Model):
     code = models.CharField(max_length=32, unique=True)
     name = models.CharField(max_length=64)
     dimension = models.CharField(max_length=32, default='each')
+    base_unit_code = models.CharField(max_length=32, blank=True)
+    factor_to_base = models.DecimalField(max_digits=24, decimal_places=12, default=1)
+    is_active = models.BooleanField(default=True)
+    row_version = models.PositiveIntegerField(default=1)
     def __str__(self): return self.name
 
 class NumberSource(models.Model):
@@ -88,18 +96,32 @@ class PartRevision(models.Model):
     reviewer = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='reviewed_part_revisions')
     publisher = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='published_part_revisions')
     row_version = models.PositiveIntegerField(default=1)
+    effective_range = DateTimeRangeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     class Meta:
-        constraints = [models.UniqueConstraint(fields=['part','revision'], name='unique_part_revision')]
+        constraints = [
+            models.UniqueConstraint(fields=['part','revision'], name='unique_part_revision'),
+            models.CheckConstraint(
+                condition=RawSQL("effective_range IS NULL OR (NOT isempty(effective_range) AND lower_inc(effective_range) AND NOT upper_inc(effective_range))", (), output_field=models.BooleanField()),
+                name='partrevision_effective_range_half_open',
+            ),
+            ExclusionConstraint(
+                name='partrevision_part_effective_range_excl',
+                expressions=[('part', RangeOperators.EQUAL), ('effective_range', RangeOperators.OVERLAPS)],
+            ),
+        ]
         ordering = ['part','revision_seq']
 
 class BOM(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    bom_code = models.CharField(max_length=64, unique=True)
+    tenant_id = models.CharField(max_length=64, default='default')
+    bom_code = models.CharField(max_length=64)
     bom_type = models.CharField(max_length=8, default='EBOM')
     name = models.CharField(max_length=200, blank=True)
     row_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['tenant_id', 'bom_code'], name='uniq_bom_tenant_code')]
 
 class BOMRevision(models.Model):
     REVISION_STATES = PartRevision.REVISION_STATES
@@ -112,18 +134,41 @@ class BOMRevision(models.Model):
     reviewer = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='reviewed_bom_revisions')
     publisher = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='published_bom_revisions')
     row_version = models.PositiveIntegerField(default=1)
+    effective_range = DateTimeRangeField(null=True, blank=True)
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=RawSQL("effective_range IS NULL OR (NOT isempty(effective_range) AND lower_inc(effective_range) AND NOT upper_inc(effective_range))", (), output_field=models.BooleanField()),
+                name='bomrevision_effective_range_half_open',
+            ),
+            ExclusionConstraint(
+                name='bomrevision_bom_effective_range_excl',
+                expressions=[('bom', RangeOperators.EQUAL), ('effective_range', RangeOperators.OVERLAPS)],
+            ),
+        ]
 
 class BOMItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     bom_revision = models.ForeignKey(BOMRevision, related_name='items', on_delete=models.PROTECT)
     parent_item = models.ForeignKey('self', null=True, blank=True, related_name='children', on_delete=models.PROTECT)
     line_no = models.PositiveIntegerField()
-    child_part_revision = models.ForeignKey(PartRevision, on_delete=models.PROTECT)
+    child_part_revision = models.ForeignKey(PartRevision, null=True, blank=True, on_delete=models.PROTECT, related_name='bom_items')
+    child_bom_revision = models.ForeignKey(BOMRevision, null=True, blank=True, on_delete=models.PROTECT, related_name='parent_items')
     quantity = models.DecimalField(max_digits=18, decimal_places=6)
+    quantity_entered = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    unit_entered = models.ForeignKey(Unit, null=True, blank=True, on_delete=models.PROTECT, related_name='entered_bom_items')
+    conversion_factor = models.DecimalField(max_digits=24, decimal_places=12, default=1)
     unit = models.ForeignKey(Unit, on_delete=models.PROTECT, null=True, blank=True)
     position = models.CharField(max_length=128, default='__NO_POSITION__')
     no_position_reason = models.CharField(max_length=255, blank=True)
-    class Meta: constraints = [models.UniqueConstraint(fields=['bom_revision','line_no'], name='uniq_bom_line')]
+    alternative_group_id = models.UUIDField(null=True, blank=True)
+    alternative_role = models.CharField(max_length=16, choices=[('primary','Primary'),('alternate','Alternate')], default='primary')
+    priority = models.PositiveIntegerField(null=True, blank=True)
+    remarks = models.TextField(blank=True)
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['bom_revision','line_no'], name='uniq_bom_line'),
+        ]
 
 class UploadSession(models.Model):
     STATES = [('created','Created'),('uploaded','Uploaded'),('verified','Verified'),('failed','Failed'),('expired','Expired'),('cancelled','Cancelled')]
@@ -219,10 +264,23 @@ class ImportJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     kind = models.CharField(max_length=32, choices=[('category','category'),('part','part'),('bom','bom')])
     upload_session = models.ForeignKey(UploadSession, on_delete=models.PROTECT)
-    status = models.CharField(max_length=20, default='queued')
+    status = models.CharField(max_length=32, default='queued')
+    business_state = models.CharField(max_length=16, default='none')
     summary = models.JSONField(default=dict, blank=True)
     error_report_key = models.CharField(max_length=512, blank=True)
+    tenant_id = models.CharField(max_length=64, default='default', db_index=True)
+    actor = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='import_jobs')
+    input_hash = models.CharField(max_length=64, blank=True)
+    preview_hash = models.CharField(max_length=64, blank=True)
+    catalog_version = models.CharField(max_length=32, blank=True)
+    permission_version = models.PositiveIntegerField(default=1)
+    confirm_token_hash = models.CharField(max_length=64, blank=True)
+    confirm_expires_at = models.DateTimeField(null=True, blank=True)
+    idempotency_key = models.CharField(max_length=200, blank=True)
+    parent_job = models.ForeignKey('self', null=True, blank=True, on_delete=models.PROTECT, related_name='retries')
+    row_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
 class ExportJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -231,7 +289,18 @@ class ExportJob(models.Model):
     status = models.CharField(max_length=20, default='queued')
     object_key = models.CharField(max_length=512, blank=True)
     filters = models.JSONField(default=dict, blank=True)
+    tenant_id = models.CharField(max_length=64, default='default', db_index=True)
+    actor = models.ForeignKey('auth.User', null=True, blank=True, on_delete=models.PROTECT, related_name='export_jobs')
+    template_version = models.CharField(max_length=32, default='v1.6')
+    snapshot_at = models.DateTimeField(null=True, blank=True)
+    row_count = models.PositiveIntegerField(default=0)
+    artifact_sha256 = models.CharField(max_length=64, blank=True)
+    artifact_expires_at = models.DateTimeField(null=True, blank=True)
+    download_count = models.PositiveIntegerField(default=0)
+    idempotency_key = models.CharField(max_length=200, blank=True)
+    row_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
 class FinalizeJob(models.Model):
     """Durable asynchronous upload finalization handle."""

@@ -1,4 +1,4 @@
-import os, uuid, hashlib
+import os, uuid, hashlib, hmac
 from datetime import timedelta
 from django.conf import settings
 from django.db import connection, transaction
@@ -7,6 +7,7 @@ from django.db.models import Q, Max, Exists, OuterRef
 from django.shortcuts import get_object_or_404
 from django.http import JsonResponse, HttpResponse, StreamingHttpResponse, Http404
 from django.core import signing
+from django.core.cache import cache
 import secrets
 from django.utils import timezone
 from rest_framework import viewsets, status
@@ -17,7 +18,7 @@ from django.contrib.auth import authenticate, login
 from django.contrib.auth.models import User, Group
 from .models import *
 from .serializers import *
-from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url
+from .jobs import run_import_job, run_export_job, cancel_import_job, cancel_export_job, export_download_url, _confirm_cache_key
 from .roles import RolePermission, user_role
 from .bom_services import BOMValidationError, validate_bom_tree
 
@@ -839,38 +840,115 @@ class UploadSessionViewSet(RoleProtectedMixin, viewsets.ViewSet):
 class ImportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
     write_roles = ('engineer','admin')
     queryset=ImportJob.objects.all().order_by('-created_at'); serializer_class=ImportJobSerializer
+    def get_queryset(self):
+        qs = super().get_queryset().filter(tenant_id=_tenant_id(self.request))
+        if user_role(self.request.user) in ('admin', 'sysadmin'):
+            return qs
+        return qs.filter(actor=self.request.user)
     def create(self, request):
+        key = str(request.headers.get('Idempotency-Key') or '').strip()
+        if not key:
+            return Response({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'}, status=428)
         payload=request.data.copy(); payload['upload_session']=payload.get('upload_session') or payload.get('upload_session_id'); payload['kind']=payload.get('kind') or 'part'
-        ser=self.get_serializer(data=payload); ser.is_valid(raise_exception=True); job=ser.save()
+        payload['tenant_id'] = _tenant_id(request)
+        payload['actor'] = request.user.pk
+        sec = getattr(request.user, 'security', None)
+        payload['permission_version'] = getattr(sec, 'permission_version', 1)
+        existing = ImportJob.objects.filter(actor=request.user, tenant_id=_tenant_id(request), idempotency_key=key).first()
+        if existing:
+            return Response(self.get_serializer(existing).data, status=200)
+        ser=self.get_serializer(data=payload); ser.is_valid(raise_exception=True); job=ser.save(actor=request.user, tenant_id=_tenant_id(request), idempotency_key=key, permission_version=getattr(getattr(request.user, 'security', None), 'permission_version', 1))
         try: run_import_job.delay(str(job.id), commit=False)
         except Exception: pass
-        return Response(self.get_serializer(job).data, status=201)
+        response = Response(self.get_serializer(job).data, status=202)
+        response['Location'] = f'/api/v1/jobs/{job.id}'
+        response['Retry-After'] = '2'
+        return response
     @action(detail=True, methods=['post'])
     def actions(self, request, pk=None):
         job=self.get_object(); name=request.data.get('action')
+        expected = request.headers.get('If-Match')
+        if not expected:
+            return Response({'code':'PRECONDITION_REQUIRED','detail':'If-Match header is required'}, status=428)
+        if expected.strip('"') != str(job.row_version):
+            return Response({'code':'CONCURRENT_MODIFICATION','detail':'job changed; reload before action'}, status=409)
+        operation_key = str(request.headers.get('Idempotency-Key') or '').strip()
+        if not operation_key:
+            return Response({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'}, status=428)
         if name=='commit':
+            token = str(request.data.get('confirm_token') or '')
+            now = timezone.now()
+            sec = getattr(request.user, 'security', None)
+            permission_version = getattr(sec, 'permission_version', 1)
+            cached_token = cache.get(_confirm_cache_key(job.id))
+            if (job.status != 'awaiting_confirmation' or not token or not job.confirm_token_hash or
+                    hashlib.sha256(token.encode()).hexdigest() != job.confirm_token_hash or
+                    not cached_token or not hmac.compare_digest(str(cached_token), token) or
+                    not job.confirm_expires_at or job.confirm_expires_at <= now or
+                    job.actor_id != request.user.id or job.permission_version != permission_version):
+                return Response({'code':'STALE_CONFIRMATION','detail':'confirmation token is invalid, expired, or no longer authorized'}, status=409)
+            job.idempotency_key = operation_key
+            job.save(update_fields=['idempotency_key','updated_at'])
             try: run_import_job.delay(str(job.id), commit=True)
             except Exception: run_import_job(str(job.id), commit=True)
-        elif name=='cancel': cancel_import_job(job.id)
-        else: return Response({'detail':'action must be commit or cancel'}, status=400)
+        elif name=='cancel':
+            job.idempotency_key = operation_key; job.save(update_fields=['idempotency_key','updated_at']); cancel_import_job(job.id)
+        elif name=='retry':
+            if job.status not in ('failed', 'completed_with_errors'):
+                return Response({'code':'STATE_TRANSITION_INVALID','detail':'only failed imports can be retried'}, status=409)
+            child = ImportJob.objects.create(kind=job.kind, upload_session=job.upload_session, tenant_id=job.tenant_id,
+                actor=request.user, permission_version=job.permission_version, parent_job=job, idempotency_key=operation_key)
+            try: run_import_job.delay(str(child.id), commit=False)
+            except Exception: run_import_job(str(child.id), commit=False)
+        else: return Response({'detail':'action must be commit, cancel, or retry'}, status=400)
+        if name == 'retry':
+            child.refresh_from_db(); return Response(self.get_serializer(child).data, status=202)
         job.refresh_from_db(); return Response(self.get_serializer(job).data)
 
 class ExportJobViewSet(RoleProtectedMixin, viewsets.ModelViewSet):
     write_roles = ('viewer','engineer','reviewer','publisher','admin')
     queryset=ExportJob.objects.all().order_by('-created_at'); serializer_class=ExportJobSerializer
+    def get_queryset(self):
+        qs = super().get_queryset().filter(tenant_id=_tenant_id(self.request))
+        if user_role(self.request.user) in ('admin', 'sysadmin'):
+            return qs
+        return qs.filter(actor=self.request.user)
     def create(self, request):
-        ser=self.get_serializer(data=request.data); ser.is_valid(raise_exception=True); job=ser.save()
+        key = str(request.headers.get('Idempotency-Key') or '').strip()
+        if not key:
+            return Response({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'}, status=428)
+        existing = ExportJob.objects.filter(actor=request.user, tenant_id=_tenant_id(request), idempotency_key=key).first()
+        if existing:
+            return Response(self.get_serializer(existing).data, status=200)
+        ser=self.get_serializer(data=request.data); ser.is_valid(raise_exception=True); job=ser.save(actor=request.user, tenant_id=_tenant_id(request), snapshot_at=timezone.now(), idempotency_key=key)
         try: run_export_job.delay(str(job.id))
         except Exception: pass
-        return Response(self.get_serializer(job).data, status=201)
+        response = Response(self.get_serializer(job).data, status=202)
+        response['Location'] = f'/api/v1/jobs/{job.id}'
+        response['Retry-After'] = '2'
+        return response
     @action(detail=True, methods=['get'])
     def download(self, request, pk=None):
         job=self.get_object(); url=export_download_url(job)
         if not url: return Response({'detail':'export not ready'}, status=409)
-        return Response({'url':url, 'expires_in':3600})
+        job.download_count += 1; job.save(update_fields=['download_count','updated_at'])
+        return Response({'url':url, 'expires_in':int(getattr(settings,'EXPORT_DOWNLOAD_URL_TTL',600))})
     @action(detail=True, methods=['post'])
     def actions(self, request, pk=None):
-        if request.data.get('action')=='cancel': cancel_export_job(self.get_object().id); return Response(self.get_serializer(self.get_object()).data)
+        job = self.get_object(); expected = request.headers.get('If-Match')
+        if not expected:
+            return Response({'code':'PRECONDITION_REQUIRED','detail':'If-Match header is required'}, status=428)
+        if expected.strip('"') != str(job.row_version):
+            return Response({'code':'CONCURRENT_MODIFICATION','detail':'job changed; reload before action'}, status=409)
+        key = str(request.headers.get('Idempotency-Key') or '').strip()
+        if not key:
+            return Response({'code':'IDEMPOTENCY_KEY_REQUIRED','detail':'Idempotency-Key header is required'}, status=428)
+        if job.idempotency_key and job.idempotency_key != key:
+            return Response({'code':'IDEMPOTENCY_KEY_REUSED','detail':'idempotency key does not match this job'}, status=409)
+        job.idempotency_key = key
+        if request.data.get('action')=='cancel':
+            cancel_export_job(job.id); job.refresh_from_db(); job.row_version += 1; job.idempotency_key = key; job.save(update_fields=['row_version','idempotency_key','updated_at'])
+            return Response(self.get_serializer(job).data)
         return Response({'detail':'action must be cancel'}, status=400)
 
 @api_view(['GET'])
@@ -937,22 +1015,29 @@ def jobs_index(request):
     requested_kind = str(request.query_params.get('kind') or '').strip().lower()
     type_filter = requested_kind if requested_kind in ('import', 'export', 'finalize') else None
     domain_filter = requested_kind if requested_kind in ('category', 'part', 'bom') else None
-    imports = ImportJob.objects.all().order_by('-created_at')[:100]
-    exports = ExportJob.objects.all().order_by('-created_at')[:100]
-    finalizes = FinalizeJob.objects.all().order_by('-created_at')[:100]
+    tenant = _tenant_id(request)
+    actor = request.user
+    visibility = Q(actor=actor)
+    if user_role(actor) in ('admin', 'sysadmin'):
+        visibility |= Q(actor__isnull=True)
+    imports = ImportJob.objects.filter(tenant_id=tenant).filter(visibility).order_by('-created_at')[:100]
+    exports = ExportJob.objects.filter(tenant_id=tenant).filter(visibility).order_by('-created_at')[:100]
+    finalizes = FinalizeJob.objects.filter(upload_session__tenant_id=tenant, upload_session__owner=actor).order_by('-created_at')[:100]
     rows = []
     if not type_filter or type_filter == 'import':
         for job in imports:
             if domain_filter and job.kind != domain_filter: continue
+            summary = dict(job.summary or {}); summary.pop('confirm_token', None)
             rows.append({'id': str(job.id), 'job_type': 'import', 'kind': job.kind,
+                         'status': job.status, 'execution_state': job.status, 'row_version': job.row_version,
                          'status': job.status, 'created_at': job.created_at,
-                         'summary': job.summary or {}, 'error_report_key': job.error_report_key,
+                         'summary': summary, 'error_report_key': job.error_report_key,
                          'upload_session': str(job.upload_session_id)})
     if not type_filter or type_filter == 'export':
         for job in exports:
             if domain_filter and job.kind != domain_filter: continue
             rows.append({'id': str(job.id), 'job_type': 'export', 'kind': job.kind,
-                         'format': job.format, 'status': job.status,
+                         'format': job.format, 'status': job.status, 'execution_state': job.status, 'row_version': job.row_version,
                          'created_at': job.created_at, 'summary': {},
                          'object_key': job.object_key, 'filters': job.filters or {}})
     if not type_filter or type_filter == 'finalize':
@@ -967,9 +1052,21 @@ def jobs_index(request):
 def job_detail(request, pk):
     for model, kind in ((ImportJob,'import'), (ExportJob,'export'), (FinalizeJob,'finalize')):
         try:
-            job=model.objects.get(pk=pk)
+            if kind == 'finalize':
+                job=model.objects.get(pk=pk, upload_session__owner=request.user, upload_session__tenant_id=_tenant_id(request))
+            else:
+                qs = model.objects.filter(pk=pk, tenant_id=_tenant_id(request))
+                if user_role(request.user) not in ('admin','sysadmin'):
+                    qs = qs.filter(actor=request.user)
+                job=qs.get()
             summary=getattr(job,'summary',None) or {}
-            return Response({'job_id':str(job.id),'job_type':kind,'subject_type':'upload_session' if kind!='export' else 'export','subject_id':str(getattr(job,'upload_session_id',job.id)),'execution_state':job.status,'commit_state':summary.get('commit_state','none'),'progress':summary.get('progress',100 if job.status=='completed' else 0),'attempt':summary.get('attempt',0),'row_count':summary.get('total',0),'error_count':summary.get('error_count',1 if getattr(job,'error','') else 0),'allowed_actions':['cancel'] if job.status in ('queued','running') else [],'created_at':job.created_at,'updated_at':getattr(job,'updated_at',job.created_at),'expires_at':None,'audit_id':None})
+            confirm_token = cache.get(_confirm_cache_key(job.id)) if kind == 'import' and job.status == 'awaiting_confirmation' else None
+            actions = ['cancel'] if job.status in ('queued','running') else []
+            if kind == 'import' and job.status == 'awaiting_confirmation': actions = ['commit','cancel']
+            if kind == 'import' and job.status == 'completed_with_errors': actions = ['retry']
+            response=Response({'job_id':str(job.id),'id':str(job.id),'job_type':kind,'subject_type':'upload_session' if kind!='export' else 'export','subject_id':str(getattr(job,'upload_session_id',job.id)),'execution_state':job.status,'status':job.status,'commit_state':getattr(job,'business_state','none'),'row_version':getattr(job,'row_version',1),'summary':summary,'confirm_token':confirm_token,'confirm_expires_at':getattr(job,'confirm_expires_at',None),'progress':summary.get('progress',100 if job.status=='completed' else 0),'attempt':summary.get('attempt',0),'row_count':getattr(job,'row_count',summary.get('total',0)),'error_count':getattr(job,'summary',{}).get('error_count',1 if getattr(job,'error','') else 0),'allowed_actions':actions,'created_at':job.created_at,'updated_at':getattr(job,'updated_at',job.created_at),'expires_at':getattr(job,'artifact_expires_at',None),'audit_id':None})
+            response['ETag'] = '"' + str(getattr(job,'row_version',1)) + '"'
+            return response
         except (model.DoesNotExist, ValueError):
             continue
     return Response({'detail':'not found'}, status=404)
@@ -978,8 +1075,24 @@ def job_detail(request, pk):
 def job_errors(request, pk):
     for model in (ImportJob, ExportJob, FinalizeJob):
         try:
-            job=model.objects.get(pk=pk); summary=getattr(job,'summary',None) or {}
-            return Response({'job_id':str(job.id),'errors':summary.get('errors',[]),'error':getattr(job,'error','')})
+            if model == FinalizeJob:
+                job=model.objects.get(pk=pk, upload_session__owner=request.user, upload_session__tenant_id=_tenant_id(request))
+            else:
+                qs = model.objects.filter(pk=pk, tenant_id=_tenant_id(request))
+                if user_role(request.user) not in ('admin','sysadmin'):
+                    qs = qs.filter(actor=request.user)
+                job=qs.get()
+            summary=getattr(job,'summary',None) or {}
+            key = getattr(job, 'error_report_key', '')
+            if key and str(request.query_params.get('format', 'json')).lower() == 'csv':
+                key = key.rsplit('.', 1)[0] + '.csv'
+            url = ''
+            if key:
+                try:
+                    url = s3_client().generate_presigned_url('get_object', Params={'Bucket': settings.MINIO_BUCKET_EXPORT, 'Key': key}, ExpiresIn=600)
+                except Exception:
+                    url = ''
+            return Response({'job_id':str(job.id),'errors':summary.get('errors',[]),'error':getattr(job,'error',''),'url':url,'download_url':url,'expires_in':600 if url else 0})
         except (model.DoesNotExist, ValueError):
             continue
     return Response({'detail':'not found'}, status=404)
@@ -1048,7 +1161,7 @@ def bom_revision_actions(request, pk=None):
             return Response(exc.detail, status=exc.status_code)
     if target == 'released':
         revisions = [obj.root_part_revision] + list(
-            PartRevision.objects.filter(bomitem__bom_revision=obj).distinct()
+            PartRevision.objects.filter(bom_items__bom_revision=obj).distinct()
         )
         for revision in revisions:
             gate_error = _release_gate(revision)

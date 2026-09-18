@@ -19,18 +19,25 @@ from decimal import Decimal, InvalidOperation
 import boto3
 from celery import shared_task
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
+from datetime import timedelta
+import secrets
 
 from .models import (
     BOM, BOMItem, BOMRevision, Category, ImportJob, Part, PartRevision,
     Unit, UploadSession, ExportJob, FinalizeJob, PartAttachment, AttachmentScan,
     AttachmentVersion,
+    UserSecurity,
 )
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_ERRORS = 1000
 CLAMAV_MAX_BYTES = int(os.getenv('CLAMAV_MAX_BYTES', str(4 * 1024 * 1024 * 1024)))
+
+def _confirm_cache_key(job_id):
+    return f'plm:import-confirm:{job_id}'
 
 def _clamd_scan(body, timeout=1800):
     """Scan a stream with clamd INSTREAM; returns raw daemon verdict."""
@@ -239,7 +246,8 @@ def _validate_part(row, index):
             "manufacturer_part_number": _text(row, "manufacturer_part_number"),
             "description": _text(row, "description"),
             "is_customized": _text(row, "is_customized", default="false").lower() in ("true", "1", "yes"),
-            "rohs_standard": _text(row, "rohs_standard")}
+            "rohs_standard": _text(row, "rohs_standard"),
+            "catalog_version": _text(row, "catalog_version")}
 
 
 def _validate_bom(row, index):
@@ -266,23 +274,115 @@ def _validate_bom(row, index):
             "name": _text(row, "name"), "revision": _text(row, "revision", default="A"),
             "root": root, "root_revision": root_rev, "child": child, "child_revision": child_rev, "quantity": quantity,
             "line_no": line_no, "unit_code": _text(row, "unit_code", "unit"),
-            "position": _text(row, "position", default="__NO_POSITION__")}
+            "position": _text(row, "position", default="__NO_POSITION__"),
+            "no_position_reason": _text(row, "no_position_reason")}
 
 
 def _error_report(job, errors):
     if not errors:
         return ""
-    key = f"imports/{job.id}/errors.json"
-    payload = json.dumps({"job_id": str(job.id), "errors": errors}, ensure_ascii=False).encode()
-    s3_client().put_object(Bucket=settings.MINIO_BUCKET_EXPORT, Key=key, Body=payload,
-                           ContentType="application/json")
-    return key
+    prefix = f"imports/{job.tenant_id}/{job.id}/errors"
+    rows = []
+    for item in errors:
+        raw = item.get('message', '') if isinstance(item, dict) else str(item)
+        code, _, message = str(raw).partition(':')
+        if not message:
+            code, message = 'IMPORT_VALIDATION_ERROR', str(raw)
+        data = item.get('data') if isinstance(item, dict) else None
+        source_value = ''
+        if isinstance(data, dict):
+            source_value = next((str(value)[:200] for value in data.values() if value not in (None, '')), '')
+        rows.append({'row_number': item.get('row', '') if isinstance(item, dict) else '', 'column': item.get('column', '') if isinstance(item, dict) else '', 'error_code': code.strip() or 'IMPORT_VALIDATION_ERROR', 'message': message.strip(), 'source_value': source_value})
+    payload = json.dumps({'job_id': str(job.id), 'errors': rows}, ensure_ascii=False, separators=(',', ':')).encode()
+    csv_out = io.StringIO(newline='')
+    writer = csv.DictWriter(csv_out, fieldnames=['row_number','column','error_code','message','source_value'], quoting=csv.QUOTE_ALL, lineterminator='\r\n')
+    writer.writeheader(); writer.writerows(rows)
+    client = s3_client()
+    client.put_object(Bucket=settings.MINIO_BUCKET_EXPORT, Key=f'{prefix}.json', Body=payload, ContentType='application/json')
+    client.put_object(Bucket=settings.MINIO_BUCKET_EXPORT, Key=f'{prefix}.csv', Body=b'\xef\xbb\xbf' + csv_out.getvalue().encode('utf-8'), ContentType='text/csv; charset=utf-8')
+    return f'{prefix}.json'
+
+def _session_input_hash(session):
+    body = s3_client().get_object(Bucket=session.bucket, Key=session.object_key)['Body']
+    digest = hashlib.sha256()
+    try:
+        for chunk in iter(lambda: body.read(1024 * 1024), b''):
+            digest.update(chunk)
+    finally:
+        body.close()
+    return digest.hexdigest()
+
+def _preview_hash(rows):
+    return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str, separators=(',', ':')).encode()).hexdigest()
+
+def _issue_confirm_token(job, *, input_hash, preview_hash, catalog_version=None):
+    token = secrets.token_urlsafe(32)
+    job.input_hash = input_hash
+    job.preview_hash = preview_hash
+    if catalog_version is not None:
+        job.catalog_version = catalog_version
+    job.confirm_token_hash = hashlib.sha256(token.encode()).hexdigest()
+    job.confirm_expires_at = timezone.now() + timedelta(seconds=int(getattr(settings, 'IMPORT_CONFIRM_TOKEN_TTL', 1800)))
+    ttl = max(1, int((job.confirm_expires_at - timezone.now()).total_seconds()))
+    # Do not expose a token for a rolled-back preview transaction.
+    transaction.on_commit(lambda: cache.set(_confirm_cache_key(job.id), token, timeout=ttl))
+    job.summary = {**(job.summary or {}), 'confirm_expires_at': job.confirm_expires_at.isoformat()}
+    job.summary.pop('confirm_token', None)
+    fields = ['input_hash', 'preview_hash', 'confirm_token_hash', 'confirm_expires_at', 'summary', 'updated_at']
+    if catalog_version is not None:
+        fields.append('catalog_version')
+    job.save(update_fields=fields)
+    return token
+
+
+def _current_catalog_version():
+    """Return the single catalog version currently represented in the DB."""
+    versions = list(Category.objects.exclude(catalog_version='').values_list('catalog_version', flat=True).distinct())
+    if not versions:
+        return ''
+    # Catalog versions are semantic (major.minor.patch), so compare numeric
+    # components instead of relying on lexical ordering (4.0.0 > 10.0.0).
+    def key(value):
+        try:
+            return (1, tuple(int(part) for part in str(value).split('.')), '')
+        except (TypeError, ValueError):
+            return (0, (), str(value))
+    return max(versions, key=key)
+
+
+def _catalog_version_for(kind, rows):
+    versions = {str(row.get('catalog_version') or '') for row in rows if row.get('catalog_version')}
+    if len(versions) > 1:
+        raise ValueError('CATALOG_VERSION_MISMATCH: import contains multiple catalog versions')
+    declared = next(iter(versions), '')
+    current = _current_catalog_version()
+    if current and declared and current != declared:
+        raise ValueError('CATALOG_VERSION_MISMATCH')
+    # An initial catalog import establishes the first active version.
+    return current or declared
+
+
+def _catalog_fingerprint():
+    return _preview_hash(list(Category.objects.order_by('major_code', 'minor_code').values()))
+
+
+def _assert_part_importable(part_revision):
+    if part_revision is not None and part_revision.revision_state != 'draft':
+        raise ValueError(f'IMMUTABLE_REVISION: part revision is not draft: {part_revision.part.part_code}/{part_revision.revision}')
+
+
+def _assert_bom_importable(bom_revision):
+    if bom_revision is not None and bom_revision.revision_state != 'draft':
+        raise ValueError(f'IMMUTABLE_REVISION: BOM revision is not draft: {bom_revision.bom.bom_code}/{bom_revision.revision}')
 
 
 def _set_import_result(job, status, total, valid, errors, **extra):
-    summary = {"total": total, "valid": valid, "error_count": len(errors),
+    summary = {**(job.summary or {}), "total": total, "valid": valid, "error_count": len(errors),
                "errors": errors[:MAX_ERRORS], **extra}
+    if status != 'awaiting_confirmation': summary.pop('confirm_token', None)
     job.status = status
+    job.business_state = 'committed' if status == 'completed' else ('staged' if status == 'awaiting_confirmation' else 'none')
+    job.row_version += 1
     job.summary = summary
     try:
         job.error_report_key = _error_report(job, errors)
@@ -290,7 +390,104 @@ def _set_import_result(job, status, total, valid, errors, **extra):
         # Reporting storage outages must not hide the validation/commit result.
         summary["error_report_error"] = str(report_exc)
         job.error_report_key = ""
-    job.save(update_fields=["status", "summary", "error_report_key"])
+    job.save(update_fields=["status", "business_state", "summary", "error_report_key", "row_version", "updated_at"])
+
+
+def _parse_import_job(job):
+    """Read and validate one upload without mutating domain tables."""
+    stream = _read_session(job.upload_session)
+    try:
+        # Hash exactly the bytes being parsed, once. A separate GET for the
+        # hash could attest different bytes after an object replacement.
+        raw = stream.read(MAX_BYTES + 1)
+    finally:
+        stream.close()
+    if len(raw) > MAX_BYTES:
+        raise ValueError('UPLOAD_SIZE_EXCEEDED: import file must not exceed 5 MiB')
+    if len(raw) != job.upload_session.size:
+        raise ValueError('INPUT_SIZE_MISMATCH')
+    rows = _rows(job.upload_session, io.BytesIO(raw))
+    parsed, errors = [], []
+    validator = {"category": _validate_category, "part": _validate_part, "bom": _validate_bom}.get(job.kind)
+    if not validator:
+        raise ValueError(f"unsupported import kind: {job.kind}")
+    total = 0
+    for index, row in enumerate(rows):
+        total += 1
+        if total > 10000:
+            raise ValueError('IMPORT_ROW_LIMIT_EXCEEDED')
+        try:
+            normalized = validator(row, index)
+            if job.kind == 'bom':
+                root_qs = PartRevision.objects.filter(
+                    part__part_code=normalized['root'], part__tenant_id=job.tenant_id,
+                    revision=normalized['root_revision'],
+                )
+                child_qs = PartRevision.objects.filter(
+                    part__part_code=normalized['child'], part__tenant_id=job.tenant_id,
+                    revision=normalized['child_revision'],
+                )
+                if not root_qs.exists():
+                    raise ValueError(f"root part/revision not found in PLM: {normalized['root']} / {normalized['root_revision']}")
+                child_revision = child_qs.first()
+                if child_revision is None:
+                    raise ValueError(f"child part/revision not found in PLM: {normalized['child']} / {normalized['child_revision']}")
+                if child_revision.revision_state != 'released':
+                    raise ValueError(f"referenced child revision is not released: {normalized['child']} / {normalized['child_revision']}")
+            parsed.append(normalized)
+        except Exception as exc:
+            errors.append({"row": index + 2, "message": str(exc), "data": row})
+    return parsed, errors, total, hashlib.sha256(raw).hexdigest()
+
+
+def _import_actor(job):
+    from django.contrib.auth import get_user_model
+    from .roles import user_role
+    actor = get_user_model().objects.select_for_update().filter(pk=job.actor_id).first()
+    security = UserSecurity.objects.select_for_update().filter(user_id=job.actor_id).first()
+    role = user_role(actor)
+    allowed = ('sysadmin', 'admin') if job.kind == 'category' else ('engineer', 'admin')
+    if not actor or not actor.is_active or role not in allowed:
+        raise ValueError('STALE_CONFIRMATION: actor is no longer authorized')
+    version = security.permission_version if security else 1
+    if version != job.permission_version:
+        raise ValueError('STALE_CONFIRMATION: actor permission version changed')
+    session = job.upload_session
+    if session.tenant_id != job.tenant_id or session.owner_id != actor.pk or session.purpose != 'import_source':
+        raise ValueError('STALE_CONFIRMATION: upload ownership or purpose changed')
+    return actor
+
+
+def _validate_commit_binding(job, parsed, input_hash):
+    """Recheck every confirmation binding immediately before commit."""
+    if not job.actor_id:
+        raise ValueError('STALE_CONFIRMATION')
+    if not job.confirm_expires_at or job.confirm_expires_at <= timezone.now():
+        raise ValueError('STALE_CONFIRMATION')
+    cached_token = cache.get(_confirm_cache_key(job.id))
+    if not cached_token or hashlib.sha256(str(cached_token).encode()).hexdigest() != job.confirm_token_hash:
+        raise ValueError('STALE_CONFIRMATION')
+    if not job.confirm_token_hash or not job.input_hash or not job.preview_hash:
+        raise ValueError('STALE_CONFIRMATION')
+    if input_hash != job.input_hash:
+        raise ValueError('STALE_CONFIRMATION')
+    if _preview_hash(parsed) != job.preview_hash:
+        raise ValueError('STALE_CONFIRMATION')
+    current_catalog = _catalog_version_for(job.kind, parsed)
+    if job.catalog_version != current_catalog or (job.summary or {}).get('catalog_fingerprint') != _catalog_fingerprint():
+        raise ValueError('STALE_CONFIRMATION')
+    if str((job.summary or {}).get('actor_id')) != str(job.actor_id):
+        raise ValueError('STALE_CONFIRMATION')
+    _import_actor(job)
+
+
+def _commit_rows(kind, rows, tenant_id):
+    if kind == 'category':
+        _commit_categories(rows)
+    elif kind == 'part':
+        _commit_parts(rows, tenant_id)
+    else:
+        _commit_boms(rows, tenant_id)
 
 
 def _commit_categories(rows):
@@ -304,86 +501,148 @@ def _commit_categories(rows):
         Category.objects.update_or_create(major_code=row["major_code"], minor_code=row["minor_code"], defaults=row)
 
 
-def _commit_parts(rows):
+def _commit_parts(rows, tenant_id='default'):
     for row in rows:
         major, minor = row["category_code"][:2], row["category_code"][2:]
         category = Category.objects.get(major_code=major, minor_code=minor)
         unit = Unit.objects.filter(code=row["unit_code"]).first() if row["unit_code"] else None
-        part, _ = Part.objects.update_or_create(part_code=row["part_code"], defaults={"category": category})
-        rev, _ = PartRevision.objects.update_or_create(part=part, revision=row["revision"], defaults={
-            "name": row["name"], "kind": row["kind"], "business_lifecycle": row["business_lifecycle"],
-            "unit": unit, "standard_code": row["standard_code"], "material": row["material"],
-            "manufacturer": row["manufacturer"], "manufacturer_part_number": row["manufacturer_part_number"],
-            "is_customized": row["is_customized"], "rohs_standard": row["rohs_standard"],
-            "description": row["description"]})
+        part = Part.objects.filter(part_code=row["part_code"], tenant_id=tenant_id).first()
+        if part is not None:
+            if part.status in ('released', 'obsolete') or part.revisions.filter(revision_state__in=('released', 'obsolete')).exists():
+                raise ValueError(f'IMMUTABLE_REVISION: published part cannot be overwritten: {row["part_code"]}')
+            part.category = category
+            part.save(update_fields=['category', 'updated_at'])
+        else:
+            part = Part.objects.create(part_code=row["part_code"], tenant_id=tenant_id, category=category)
+        rev = PartRevision.objects.filter(part=part, revision=row["revision"]).first()
+        _assert_part_importable(rev)
+        if rev is None:
+            rev = PartRevision(part=part, revision=row["revision"])
+        rev.name = row["name"]
+        rev.kind = row["kind"]
+        rev.business_lifecycle = row["business_lifecycle"]
+        rev.unit = unit
+        rev.standard_code = row["standard_code"]
+        rev.material = row["material"]
+        rev.manufacturer = row["manufacturer"]
+        rev.manufacturer_part_number = row["manufacturer_part_number"]
+        rev.is_customized = row["is_customized"]
+        rev.rohs_standard = row["rohs_standard"]
+        rev.description = row["description"]
+        rev.save()
 
 
-def _commit_boms(rows):
+def _commit_boms(rows, tenant_id='default'):
     grouped = {}
     for row in rows:
         grouped.setdefault((row["bom_code"], row["revision"]), []).append(row)
     for (bom_code, revision), items in grouped.items():
         first = items[0]
-        bom, _ = BOM.objects.update_or_create(bom_code=bom_code, defaults={"bom_type": first["bom_type"], "name": first["name"]})
-        root = PartRevision.objects.filter(part__part_code=first["root"], revision=first["root_revision"]).first()
+        bom = BOM.objects.filter(bom_code=bom_code, tenant_id=tenant_id).first()
+        if bom is None:
+            bom = BOM.objects.create(bom_code=bom_code, tenant_id=tenant_id,
+                                     bom_type=first["bom_type"], name=first["name"])
+        else:
+            if bom.revisions.filter(revision_state__in=('released', 'obsolete')).exists():
+                raise ValueError(f'IMMUTABLE_REVISION: published BOM cannot be overwritten: {bom_code}')
+            bom.bom_type = first["bom_type"]
+            bom.name = first["name"]
+            bom.save(update_fields=['bom_type', 'name'])
+        root = PartRevision.objects.filter(
+            part__part_code=first["root"], part__tenant_id=tenant_id,
+            revision=first["root_revision"],
+        ).select_related('part').first()
         if not root:
             raise ValueError(f"root part not found: {first['root']}")
-        brevision, _ = BOMRevision.objects.update_or_create(bom=bom, revision=revision, defaults={"root_part_revision": root})
+        brevision = BOMRevision.objects.filter(bom=bom, revision=revision).select_related('bom').first()
+        _assert_bom_importable(brevision)
+        if brevision is None:
+            brevision = BOMRevision.objects.create(bom=bom, revision=revision, root_part_revision=root)
+        else:
+            brevision.root_part_revision = root
+            brevision.save(update_fields=['root_part_revision'])
         for row in items:
-            child = PartRevision.objects.filter(part__part_code=row["child"], revision=row["child_revision"]).first()
+            child = PartRevision.objects.filter(
+                part__part_code=row["child"], part__tenant_id=tenant_id,
+                revision=row["child_revision"],
+            ).select_related('part').first()
             if not child:
                 raise ValueError(f"child part not found: {row['child']}")
+            if child.revision_state != 'released':
+                raise ValueError(f"referenced child revision is not released: {row['child']} / {row['child_revision']}")
             unit = Unit.objects.filter(code=row["unit_code"]).first() if row["unit_code"] else None
             BOMItem.objects.update_or_create(bom_revision=brevision, line_no=row["line_no"], defaults={"child_part_revision": child, "quantity": row["quantity"], "unit": unit, "position": row["position"]})
+        from .bom_services import validate_bom_tree
+        validate_bom_tree(brevision, lifecycle_gate=True)
 
 
 def process_import_job(job_id, commit=False):
+    """Run a preview or commit with one durable state transition.
+
+    Parsing happens before the final lock, but every commit binding and domain
+    write is rechecked while the Job row is locked. This makes duplicate Celery
+    deliveries harmless and gives cancellation deterministic lock ordering.
+    """
     with transaction.atomic():
-        job = ImportJob.objects.select_for_update().select_related("upload_session").get(pk=job_id)
-        if commit and (job.status != "dry_run" or (job.summary or {}).get("error_count", 1) != 0):
-            raise ValueError("commit requires a successful dry_run import with zero errors")
-        if not commit and job.status not in ("queued", "dry_run"):
-            return job.summary or {"status": job.status}
-    try:
-        stream = _read_session(job.upload_session)
-        rows = _rows(job.upload_session, stream)
-        parsed, errors = [], []
-        validator = {"category": _validate_category, "part": _validate_part, "bom": _validate_bom}.get(job.kind)
-        if not validator:
-            raise ValueError(f"unsupported import kind: {job.kind}")
-        total = 0
-        for index, row in enumerate(rows):
-            total += 1
-            try:
-                normalized = validator(row, index)
-                # Preview must expose downstream PLM matching errors before a
-                # user can commit an external BOM.  Commit repeats the check
-                # inside one transaction for race safety.
-                if job.kind == 'bom':
-                    root_qs = PartRevision.objects.filter(part__part_code=normalized['root'], revision=normalized['root_revision'])
-                    child_qs = PartRevision.objects.filter(part__part_code=normalized['child'], revision=normalized['child_revision'])
-                    if not root_qs.exists():
-                        raise ValueError(f"root part/revision not found in PLM: {normalized['root']} / {normalized['root_revision']}")
-                    if not child_qs.exists():
-                        raise ValueError(f"child part/revision not found in PLM: {normalized['child']} / {normalized['child_revision']}")
-                    child_revision = child_qs.first()
-                    if child_revision.revision_state != 'released':
-                        raise ValueError(f"referenced child revision is not released: {normalized['child']} / {normalized['child_revision']}")
-                parsed.append(normalized)
-            except Exception as exc:
-                errors.append({"row": index + 2, "message": str(exc), "data": row})
-        if errors or not commit:
-            _set_import_result(job, "dry_run" if not commit else "failed", total, len(parsed), errors)
+        job = ImportJob.objects.select_for_update().select_related('upload_session').get(pk=job_id)
+        if not commit and job.status not in ('queued', 'dry_run'):
+            return job.summary or {'status': job.status}
+        if commit and job.status in ('completed', 'failed', 'cancelled', 'expired'):
+            return job.summary or {'status': job.status}
+        if commit and job.status not in ('awaiting_confirmation', 'committing', 'dry_run'):
+            raise ValueError('STATE_TRANSITION_INVALID')
+        if commit and (job.summary or {}).get('error_count', 1) != 0:
+            raise ValueError('commit requires a successful dry_run import with zero errors')
+
+        try:
+            parsed, errors, total, input_hash = _parse_import_job(job)
+            catalog_version = _catalog_version_for(job.kind, parsed)
+            if errors:
+                status = 'failed' if commit else 'completed_with_errors'
+                _set_import_result(job, status, total, len(parsed), errors)
+                return job.summary
+
+            if not commit:
+                # Execute the same business commit code inside a savepoint and
+                # force a rollback so previews catch FK, immutability, and BOM
+                # graph errors without writing formal domain rows.
+                try:
+                    with transaction.atomic():
+                        _commit_rows(job.kind, parsed, job.tenant_id)
+                        raise RuntimeError('_preview_rollback')
+                except RuntimeError as exc:
+                    if str(exc) != '_preview_rollback':
+                        raise
+                _set_import_result(job, 'awaiting_confirmation', total, len(parsed), [], catalog_version=catalog_version)
+                job.summary = {**(job.summary or {}), 'actor_id': job.actor_id,
+                               'catalog_fingerprint': _catalog_fingerprint()}
+                _issue_confirm_token(job, input_hash=input_hash, preview_hash=_preview_hash(parsed), catalog_version=catalog_version)
+                return job.summary
+
+            _validate_commit_binding(job, parsed, input_hash)
+            with transaction.atomic():
+                _commit_rows(job.kind, parsed, job.tenant_id)
+            _set_import_result(job, 'completed', total, len(parsed), [], created=len(parsed))
+            job.confirm_token_hash = ''
+            job.confirm_expires_at = None
+            job.save(update_fields=['confirm_token_hash', 'confirm_expires_at', 'updated_at'])
+            transaction.on_commit(lambda: cache.delete(_confirm_cache_key(job.id)))
             return job.summary
-        with transaction.atomic():
-            if job.kind == "category": _commit_categories(parsed)
-            elif job.kind == "part": _commit_parts(parsed)
-            else: _commit_boms(parsed)
-        _set_import_result(job, "completed", total, len(parsed), [], created=len(parsed))
-        return job.summary
-    except Exception as exc:
-        _set_import_result(job, "failed", 0, 0, [{"row": 0, "message": str(exc)}])
-        raise
+        except Exception as exc:
+            error_text = str(exc)
+            if commit and (error_text.startswith('STALE_CONFIRMATION') or error_text.startswith('CATALOG_VERSION_MISMATCH')):
+                stale = error_text.startswith('STALE_CONFIRMATION')
+                job.status = 'expired' if stale else 'failed'
+                job.business_state = 'staged' if job.status == 'expired' else 'none'
+                job.confirm_token_hash = ''
+                job.row_version += 1
+                job.summary = {**(job.summary or {}), 'error_count': 1,
+                               'errors': [{'row': 0, 'message': str(exc)}]}
+                job.save(update_fields=['status', 'business_state', 'confirm_token_hash', 'row_version', 'summary', 'updated_at'])
+                transaction.on_commit(lambda: cache.delete(_confirm_cache_key(job.id)))
+            else:
+                _set_import_result(job, 'failed', 0, 0, [{'row': 0, 'message': str(exc)}])
+            raise
 
 
 @shared_task(name="plm.process_import_job")
@@ -395,11 +654,17 @@ def cancel_import_job(job_id):
     """Cancel a queued/dry-run import without touching domain tables."""
     with transaction.atomic():
         job = ImportJob.objects.select_for_update().get(pk=job_id)
-        if job.status in ("completed", "failed", "cancelled"):
-            return {"status": job.status}
+        if job.status in ("completed", "failed", "cancelled", "expired"):
+            return job.summary or {"status": job.status}
+        if job.status not in ('queued', 'running', 'awaiting_confirmation', 'committing', 'dry_run'):
+            raise ValueError('STATE_TRANSITION_INVALID')
         job.status = "cancelled"
+        cache.delete(_confirm_cache_key(job.id))
+        job.confirm_token_hash = ''
+        job.row_version += 1
         job.summary = {**(job.summary or {}), "cancelled_at": timezone.now().isoformat()}
-        job.save(update_fields=["status", "summary"])
+        job.save(update_fields=["status", "confirm_token_hash", "row_version", "summary", "updated_at"])
+        transaction.on_commit(lambda: cache.delete(_confirm_cache_key(job.id)))
         return job.summary
 
 
@@ -423,30 +688,23 @@ def _export_rows(kind, filters):
 def run_export_job(job_id):
     job = ExportJob.objects.get(pk=job_id)
     try:
-        header, rows = _export_rows(job.kind, job.filters or {})
-        out = io.StringIO(newline="")
-        writer = csv.writer(out)
-        writer.writerow(header)
-        count = 0
-        for row in rows:
-            writer.writerow([_safe_cell(value) for value in row])
-            count += 1
+        from .export_service import render_export
         extension = "json" if job.format.lower() == "json" else "csv"
-        if extension == "json":
-            # Rebuild from the CSV-compatible rows to keep export columns stable.
-            out = io.StringIO(newline="")
-            payload = [dict(zip(header, [_safe_cell(value) for value in row])) for row in _export_rows(job.kind, job.filters or {})[1]]
-            out.write(json.dumps(payload, ensure_ascii=False, default=str))
-        key = f"exports/{job.id}.{extension}"
-        body = out.getvalue().encode("utf-8")
-        s3_client().put_object(Bucket=settings.MINIO_BUCKET_EXPORT, Key=key, Body=body,
-                               ContentType="application/json" if extension == "json" else "text/csv; charset=utf-8")
+        body, count, content_type = render_export(job.kind, job.format, job.filters or {}, job.tenant_id)
+        key = f"exports/{job.tenant_id}/{job.id}.{extension}"
+        s3_client().put_object(Bucket=settings.MINIO_BUCKET_EXPORT, Key=key, Body=body, ContentType=content_type)
+
         job.status, job.object_key = "completed", key
-        job.save(update_fields=["status", "object_key"])
+        job.row_count = count
+        job.artifact_sha256 = hashlib.sha256(body).hexdigest()
+        job.artifact_expires_at = timezone.now() + timedelta(seconds=int(getattr(settings, 'EXPORT_ARTIFACT_TTL', 86400)))
+        job.row_version += 1
+        job.save(update_fields=["status", "object_key", "row_count", "artifact_sha256", "artifact_expires_at", "row_version", "updated_at"])
         return {"rows": count, "object_key": key}
     except Exception:
         job.status = "failed"
-        job.save(update_fields=["status"])
+        job.row_version += 1
+        job.save(update_fields=["status", "row_version", "updated_at"])
         raise
 
 
@@ -460,9 +718,9 @@ def cancel_export_job(job_id):
 
 
 def export_download_url(job, expires=3600):
-    if not job.object_key or job.status != "completed":
+    if not job.object_key or job.status != "completed" or (job.artifact_expires_at and job.artifact_expires_at <= timezone.now()):
         return ""
-    return s3_client().generate_presigned_url("get_object", Params={"Bucket": settings.MINIO_BUCKET_EXPORT, "Key": job.object_key}, ExpiresIn=expires)
+    return s3_client().generate_presigned_url("get_object", Params={"Bucket": settings.MINIO_BUCKET_EXPORT, "Key": job.object_key}, ExpiresIn=min(expires, int(getattr(settings, 'EXPORT_DOWNLOAD_URL_TTL', 600))))
 
 @shared_task(name='plm.finalize_upload_job')
 def finalize_upload_job(job_id):

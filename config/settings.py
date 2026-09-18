@@ -42,3 +42,8 @@ if PLM_PRODUCTION:
     if MINIO_PUBLIC_ENDPOINT == MINIO_ENDPOINT:
         raise RuntimeError('MINIO_S3_PUBLIC_ENDPOINT must differ from MINIO_S3_CONTROL_ENDPOINT')
 CSRF_TRUSTED_ORIGINS=[u.strip() for u in os.getenv('DJANGO_CSRF_TRUSTED_ORIGINS','http://localhost,http://localhost:5173,http://localhost:8000').split(',') if u.strip()]
+IMPORT_CONFIRM_TOKEN_TTL=int(os.getenv('IMPORT_CONFIRM_TOKEN_TTL','1800'))
+IMPORT_JOB_TTL=int(os.getenv('IMPORT_JOB_TTL','86400'))
+EXPORT_ARTIFACT_TTL=int(os.getenv('EXPORT_ARTIFACT_TTL','86400'))
+EXPORT_DOWNLOAD_URL_TTL=int(os.getenv('EXPORT_DOWNLOAD_URL_TTL','600'))
+EXPORT_MAX_ROWS=int(os.getenv('EXPORT_MAX_ROWS','100000'))

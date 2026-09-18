@@ -9,6 +9,7 @@ from .models import AuditEvent, BOMItem, BOMRevision
 from .serializers import BOMItemSerializer, BOMRevisionSerializer
 from .roles import RolePermission
 from .bom_services import validate_bom_tree
+from .views import _tenant_id
 
 
 class BOMWriteError(APIException):
@@ -18,7 +19,10 @@ class BOMWriteError(APIException):
 
 
 def lock_revision(request, revision_id):
-    obj = get_object_or_404(BOMRevision.objects.select_for_update(), pk=revision_id)
+    obj = get_object_or_404(
+        BOMRevision.objects.select_for_update().filter(bom__tenant_id=_tenant_id(request)),
+        pk=revision_id,
+    )
     if obj.revision_state != 'draft':
         raise BOMWriteError('IMMUTABLE_REVISION', 'Only draft BOM revisions can be edited.', 409)
     expected = request.headers.get('If-Match')
@@ -42,7 +46,8 @@ class BOMRevisionViewSet(viewsets.ModelViewSet):
     read_roles = ('engineer', 'reviewer', 'publisher', 'auditor', 'viewer', 'sysadmin', 'admin')
     write_roles = ('engineer',)
     serializer_class = BOMRevisionSerializer
-    queryset = BOMRevision.objects.select_related('bom', 'root_part_revision__part').prefetch_related('items')
+    def get_queryset(self):
+        return BOMRevision.objects.filter(bom__tenant_id=_tenant_id(self.request)).select_related('bom', 'root_part_revision__part').prefetch_related('items')
     http_method_names = ['get', 'patch', 'head', 'options']
 
     @transaction.atomic
@@ -60,7 +65,7 @@ class BOMRevisionViewSet(viewsets.ModelViewSet):
     def tree(self, request, pk=None):
         obj = self.get_object()
         validate_bom_tree(obj)
-        rows = list(obj.items.select_related('child_part_revision__part', 'unit').order_by('line_no'))
+        rows = list(obj.items.select_related('child_part_revision__part', 'child_bom_revision__bom', 'unit').order_by('line_no'))
         data = BOMItemSerializer(rows, many=True).data
         nodes = {str(row['id']): {**row, 'children': []} for row in data}
         roots = []
@@ -84,7 +89,7 @@ class BOMItemViewSet(viewsets.ModelViewSet):
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
-        return BOMItem.objects.filter(bom_revision_id=self.kwargs['bom_revision_pk']).select_related('child_part_revision__part', 'unit', 'parent_item').order_by('line_no')
+        return BOMItem.objects.filter(bom_revision_id=self.kwargs['bom_revision_pk'], bom_revision__bom__tenant_id=_tenant_id(self.request)).select_related('child_part_revision__part', 'child_bom_revision__bom', 'unit', 'parent_item').order_by('line_no')
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
